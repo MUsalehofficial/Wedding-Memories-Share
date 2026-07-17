@@ -256,7 +256,7 @@ export async function downloadDriveFile(accessToken: string, fileId: string): Pr
 export async function queryResumableOffset(
   uploadUrl: string,
   totalBytes: number,
-): Promise<{ status: number; range: string | null; nextOffset: number }> {
+): Promise<{ status: number; range: string | null; nextOffset: number; fileId: string | null }> {
   const res = await fetch(uploadUrl, {
     method: 'PUT',
     headers: {
@@ -266,13 +266,22 @@ export async function queryResumableOffset(
   })
   const range = res.headers.get('Range')
   if (res.status === 200 || res.status === 201) {
-    return { status: res.status, range, nextOffset: totalBytes }
+    // ponytail: browser may be blocked from reading this 200 (missing ACAO); Edge must parse id
+    let fileId: string | null = null
+    try {
+      const meta = (await res.json()) as { id?: string }
+      fileId = meta.id ?? null
+    } catch {
+      fileId = null
+    }
+    return { status: res.status, range, nextOffset: totalBytes, fileId }
   }
   // 308 Resume Incomplete — partial or empty
   return {
     status: res.status,
     range,
     nextOffset: nextOffsetFromRange(range) ?? 0,
+    fileId: null,
   }
 }
 

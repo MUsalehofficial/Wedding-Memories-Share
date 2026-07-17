@@ -9,7 +9,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "test:e2e": "playwright test",
-    "test:unit-shared": "node ../supabase/functions/_shared/hardening.node-test.mjs && node ../supabase/functions/_shared/capacity.node-test.mjs && node ../supabase/functions/_shared/admin_auth.node-test.mjs && node ../supabase/functions/_shared/access_code_rotate.node-test.mjs && node ../supabase/functions/_shared/invite_token.node-test.mjs"
+    "test:unit-shared": "node ../supabase/functions/_shared/hardening.node-test.mjs && node ../supabase/functions/_shared/capacity.node-test.mjs && node ../supabase/functions/_shared/admin_auth.node-test.mjs && node ../supabase/functions/_shared/access_code_rotate.node-test.mjs && node ../supabase/functions/_shared/invite_token.node-test.mjs && node ../supabase/functions/_shared/google_drive_query.node-test.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.4.0",

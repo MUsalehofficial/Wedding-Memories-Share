@@ -32,3 +32,4 @@ credentials.json
 # Local deploy payloads (may contain full function source; never commit)
 scripts/.deploy-wedding-api*.json
 
+scripts/.wedding-api-bundled.ts
