@@ -8,6 +8,9 @@ import {
 import { DEFAULT_CHUNK_BYTES } from '../_shared/chunks.ts'
 import { mintGuestToken, verifyGuestToken } from '../_shared/guest_token.ts'
 import { previewObjectPath, validateUploadMeta } from '../_shared/upload_validation.ts'
+import { hashAccessCode, timingSafeEqual } from '../_shared/access_code.ts'
+import { adminSecretConfigured, resolveAdminAuth } from '../_shared/admin_auth.ts'
+import { isDriveUploadBlocked, markReconnectRequired } from '../_shared/reconnect.ts'
 import {
   assertPrivatePermissions,
   buildGoogleAuthorizeUrl,
@@ -30,7 +33,7 @@ import {
 } from '../_shared/google_drive.ts'
 
 /**
- * Wedding API — Google Drive hardening spike (not full guest/admin product).
+ * Wedding API — guest upload + gallery MVP (Google Drive originals, private previews).
  */
 
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
@@ -60,11 +63,38 @@ function guestSecret(): string {
   return s
 }
 
+function requireAdmin(
+  req: Request,
+  origin: string | null,
+  requestId: string,
+): { ok: true } | { ok: false; response: Response } {
+  // ADMIN_EMAIL is never a passphrase — only ADMIN_PANEL_SECRET.
+  const result = resolveAdminAuth(Deno.env.get('ADMIN_PANEL_SECRET'), req.headers.get('x-admin-secret'))
+  if (result.ok) return { ok: true }
+  const status = result.code === 'admin_not_configured' ? 503 : 401
+  return {
+    ok: false,
+    response: json(
+      {
+        error: result.code,
+        message:
+          result.code === 'admin_not_configured'
+            ? 'Administrator access is not configured.'
+            : 'Administrator authentication failed.',
+        requestId,
+      },
+      status,
+      origin,
+      requestId,
+    ),
+  }
+}
+
 async function loadEventSettings(sb: ReturnType<typeof adminClient>) {
   const { data } = await sb
     .from('events')
     .select(
-      'id, video_uploads_enabled, upload_safety_reserve_bytes, capacity_warn_ratio, capacity_critical_ratio, uploads_enabled, max_image_bytes, max_video_bytes',
+      'id, couple_names, gallery_enabled, video_uploads_enabled, upload_safety_reserve_bytes, capacity_warn_ratio, capacity_critical_ratio, uploads_enabled, max_image_bytes, max_video_bytes, access_code_hash, access_code_salt, moderation_enabled, guest_token_version',
     )
     .eq('slug', 'muhammad-basmala')
     .maybeSingle()
@@ -78,7 +108,16 @@ async function loadEventSettings(sb: ReturnType<typeof adminClient>) {
     maxImageBytes: Number(data.max_image_bytes ?? 20 * 1024 * 1024),
     maxVideoBytes: Number(data.max_video_bytes ?? 100 * 1024 * 1024),
   }
-  return { eventId: data.id as string, settings }
+  return {
+    eventId: data.id as string,
+    settings,
+    coupleNames: data.couple_names as string,
+    galleryEnabled: data.gallery_enabled !== false,
+    accessCodeHash: data.access_code_hash as string,
+    accessCodeSalt: data.access_code_salt as string,
+    moderationEnabled: data.moderation_enabled === true,
+    guestTokenVersion: Number(data.guest_token_version ?? 1),
+  }
 }
 
 async function loadRefreshToken(sb: ReturnType<typeof adminClient>, eventId: string) {
@@ -87,7 +126,8 @@ async function loadRefreshToken(sb: ReturnType<typeof adminClient>, eventId: str
     .select('id, status, refresh_token_vault_secret_id')
     .eq('event_id', eventId)
     .maybeSingle()
-  if (!integ || integ.status !== 'connected' || !integ.refresh_token_vault_secret_id) {
+  if (!integ || isDriveUploadBlocked(integ.status) || integ.status !== 'connected' || !integ.refresh_token_vault_secret_id) {
+    if (integ?.status === 'reconnect_required') throw new Error('google_drive_reconnect_required')
     throw new Error('google_drive_disconnected')
   }
   const { data: token, error } = await sb.rpc('wedding_vault_get', {
@@ -177,10 +217,15 @@ async function loadOrEnsureFolders(
 async function requireGuest(
   req: Request,
   eventId: string,
+  guestTokenVersion: number,
 ): Promise<{ ok: true } | { ok: false; response: Response }> {
   const origin = req.headers.get('Origin')
   const requestId = req.headers.get('x-request-id') ?? newRequestId()
-  const verified = await verifyGuestToken(guestSecret(), req.headers.get('x-guest-token'))
+  const verified = await verifyGuestToken(
+    guestSecret(),
+    req.headers.get('x-guest-token'),
+    guestTokenVersion,
+  )
   if (!verified.ok) {
     return {
       ok: false,
@@ -224,14 +269,47 @@ async function finishGoogleOAuth(
   }
 
   const { eventId } = await loadEventSettings(sb)
-  const { data: secretId, error: vaultErr } = await sb.rpc('wedding_vault_put', {
-    secret_name: `google_refresh_${eventId}`,
-    secret_value: tokens.refresh_token,
-  })
-  if (vaultErr || !secretId) throw vaultErr ?? new Error('vault_put_failed')
+
+  // Prefer updating the existing Vault secret so we don't orphan prior secret rows.
+  const { data: existing } = await sb
+    .from('google_drive_integrations')
+    .select(
+      'refresh_token_vault_secret_id, root_folder_id, originals_folder_id, originals_images_folder_id, originals_videos_folder_id, exports_folder_id',
+    )
+    .eq('event_id', eventId)
+    .maybeSingle()
+
+  let secretId = existing?.refresh_token_vault_secret_id as string | null
+  if (secretId) {
+    await sb.rpc('wedding_vault_update', {
+      secret_id: secretId,
+      secret_value: tokens.refresh_token,
+    })
+  } else {
+    const { data: newId, error: vaultErr } = await sb.rpc('wedding_vault_put', {
+      secret_name: `google_refresh_${eventId}`,
+      secret_value: tokens.refresh_token,
+    })
+    if (vaultErr || !newId) throw vaultErr ?? new Error('vault_put_failed')
+    secretId = newId as string
+  }
 
   const quota = await fetchDriveQuota(tokens.access_token)
-  const tree = await ensureWeddingFolderTree(tokens.access_token)
+  const foldersComplete =
+    existing?.root_folder_id &&
+    existing.originals_folder_id &&
+    existing.originals_images_folder_id &&
+    existing.originals_videos_folder_id &&
+    existing.exports_folder_id
+  const tree = foldersComplete
+    ? {
+      rootFolderId: existing.root_folder_id as string,
+      originalsFolderId: existing.originals_folder_id as string,
+      originalsImagesFolderId: existing.originals_images_folder_id as string,
+      originalsVideosFolderId: existing.originals_videos_folder_id as string,
+      exportsFolderId: existing.exports_folder_id as string,
+    }
+    : await ensureWeddingFolderTree(tokens.access_token)
 
   await sb.from('google_drive_integrations').upsert(
     {
@@ -255,8 +333,15 @@ async function finishGoogleOAuth(
     { onConflict: 'event_id' },
   )
 
+  // Re-enable uploads after successful reconnect (admin can still disable later).
+  await sb
+    .from('events')
+    .update({ uploads_enabled: true, updated_at: new Date().toISOString() })
+    .eq('id', eventId)
+
   const view = {
     connected: true,
+    reconnect: true,
     foldersRedacted: {
       root: redactId(tree.rootFolderId),
       originals: redactId(tree.originalsFolderId),
@@ -276,9 +361,8 @@ async function finishGoogleOAuth(
 
   if (htmlOk) {
     return new Response(
-      `<!doctype html><html><body style="font-family:serif;padding:2rem">
-       <p>Google Drive connected. You can close this window.</p>
-       <p>Quota limit bytes: ${quota.limit ?? 'unknown'}</p>
+      `<!doctype html><html><body style="font-family:serif;padding:2rem;background:#faf7f0;color:#7a5528">
+       <p>Google Drive connected. You can close this window and return to the admin page.</p>
        </body></html>`,
       { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
     )
@@ -310,14 +394,24 @@ Deno.serve(async (req) => {
     if (route === 'gdrive-health' && req.method === 'GET') {
       const presence = googleSecretPresence()
       const ready = Object.values(presence).every(Boolean)
+      const adminConfigured = adminSecretConfigured(Deno.env.get('ADMIN_PANEL_SECRET'))
       return json(
         {
           ready,
           secrets: {
             ...presence,
             GUEST_TOKEN_SIGNING_SECRET: Boolean(Deno.env.get('GUEST_TOKEN_SIGNING_SECRET')),
+            ADMIN_PANEL_SECRET: adminConfigured,
+            // ADMIN_EMAIL is identity-only — never treated as a passphrase; not reported as auth.
           },
-          scopesConfigured: googleConfig().scopes.split(/\s+/).filter(Boolean),
+          adminConfigured,
+          scopesConfigured: (() => {
+            try {
+              return googleConfig().scopes.split(/\s+/).filter(Boolean)
+            } catch {
+              return []
+            }
+          })(),
           requestId,
         },
         ready ? 200 : 503,
@@ -327,6 +421,8 @@ Deno.serve(async (req) => {
     }
 
     if (route === 'google-connect' && req.method === 'GET') {
+      const admin = requireAdmin(req, origin, requestId)
+      if (!admin.ok) return admin.response
       googleConfig()
       const state = crypto.randomUUID()
       const sb = adminClient()
@@ -368,12 +464,134 @@ Deno.serve(async (req) => {
     }
 
     if (route === 'gdrive-mint-guest' && req.method === 'POST') {
-      // Hardening harness only — mint short-lived guest token for spike tests.
+      // Harness only — admin-gated; guests must use verify-access-code.
+      const admin = requireAdmin(req, origin, requestId)
+      if (!admin.ok) return admin.response
       const sb = adminClient()
-      const { eventId } = await loadEventSettings(sb)
-      const token = await mintGuestToken(guestSecret(), eventId, 3600)
-      // ponytail: return token for harness; never log it
+      const { eventId, guestTokenVersion } = await loadEventSettings(sb)
+      const token = await mintGuestToken(guestSecret(), eventId, 3600, guestTokenVersion)
       return json({ ok: true, guestToken: token, expiresInSec: 3600, requestId }, 200, origin, requestId)
+    }
+
+    if (route === 'event-public' && req.method === 'GET') {
+      const sb = adminClient()
+      const { eventId, coupleNames, galleryEnabled, settings } = await loadEventSettings(sb)
+      const { data: integ } = await sb
+        .from('google_drive_integrations')
+        .select('status, last_error')
+        .eq('event_id', eventId)
+        .maybeSingle()
+      const reconnectRequired = integ?.status === 'reconnect_required'
+      return json(
+        {
+          coupleNames,
+          galleryEnabled,
+          uploadsEnabled: settings.uploadsEnabled !== false && !reconnectRequired,
+          videoUploadsEnabled: settings.videoUploadsEnabled,
+          maxImageBytes: settings.maxImageBytes,
+          maxVideoBytes: settings.maxVideoBytes,
+          driveStatus: integ?.status ?? 'disconnected',
+          reconnectRequired,
+          uploadsPausedReason: reconnectRequired
+            ? 'Google Drive needs administrator reconnect. Existing memories remain visible.'
+            : settings.uploadsEnabled === false
+            ? 'Uploads are temporarily paused.'
+            : null,
+          requestId,
+        },
+        200,
+        origin,
+        requestId,
+      )
+    }
+
+    if (route === 'verify-access-code' && req.method === 'POST') {
+      const body = await req.json() as { code?: string }
+      const code = (body.code ?? '').trim()
+      if (!code) return json({ error: 'missing_code', requestId }, 400, origin, requestId)
+      const sb = adminClient()
+      const { eventId, accessCodeHash, accessCodeSalt, guestTokenVersion } = await loadEventSettings(sb)
+      const hashed = await hashAccessCode(accessCodeSalt, code)
+      if (!timingSafeEqual(hashed, accessCodeHash)) {
+        return json({ error: 'invalid_code', requestId }, 401, origin, requestId)
+      }
+      const token = await mintGuestToken(guestSecret(), eventId, 60 * 60 * 12, guestTokenVersion)
+      return json({ ok: true, guestToken: token, expiresInSec: 60 * 60 * 12, requestId }, 200, origin, requestId)
+    }
+
+    if (route === 'gallery' && req.method === 'GET') {
+      const sb = adminClient()
+      const { eventId, galleryEnabled, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
+      if (!guest.ok) return guest.response
+      if (!galleryEnabled) {
+        return json({ error: 'gallery_disabled', items: [], requestId }, 403, origin, requestId)
+      }
+      const sort = url.searchParams.get('sort') === 'oldest' ? 'oldest' : 'newest'
+      const { data: rows, error } = await sb
+        .from('media')
+        .select(
+          'id, media_kind, guest_name, guest_message, size_bytes, mime_type, preview_object_key, video_poster_object_key, created_at, moderation_status, upload_status, status',
+        )
+        .eq('event_id', eventId)
+        .eq('upload_status', 'uploaded')
+        .eq('moderation_status', 'approved')
+        .eq('status', 'approved')
+        .order('created_at', { ascending: sort === 'oldest' })
+        .limit(200)
+      if (error) throw error
+
+      const items = []
+      for (const row of rows ?? []) {
+        const path =
+          row.media_kind === 'video'
+            ? row.video_poster_object_key ?? row.preview_object_key
+            : row.preview_object_key
+        let previewUrl: string | null = null
+        if (path) {
+          const { data: signed } = await sb.storage
+            .from(PREVIEW_BUCKET)
+            .createSignedUrl(path, SIGNED_TTL_SEC)
+          previewUrl = signed?.signedUrl ?? null
+        }
+        items.push({
+          id: row.id,
+          mediaKind: row.media_kind,
+          guestName: row.guest_name,
+          guestMessage: row.guest_message,
+          mimeType: row.mime_type,
+          createdAt: row.created_at,
+          hasPreview: Boolean(path),
+          previewUrl,
+          previewExpiresInSec: path ? SIGNED_TTL_SEC : null,
+        })
+      }
+      return json({ items, sort, requestId }, 200, origin, requestId)
+    }
+
+    if (route === 'gdrive-status' && req.method === 'GET') {
+      const admin = requireAdmin(req, origin, requestId)
+      if (!admin.ok) return admin.response
+      const sb = adminClient()
+      const { eventId, settings } = await loadEventSettings(sb)
+      const { data: integ } = await sb
+        .from('google_drive_integrations')
+        .select('status, last_error, last_quota_limit_bytes, last_quota_usage_bytes, connected_at')
+        .eq('event_id', eventId)
+        .maybeSingle()
+      return json(
+        {
+          status: integ?.status ?? 'disconnected',
+          lastError: integ?.last_error ?? null,
+          reconnectRequired: integ?.status === 'reconnect_required',
+          uploadsEnabled: settings.uploadsEnabled,
+          connectedAt: integ?.connected_at ?? null,
+          requestId,
+        },
+        200,
+        origin,
+        requestId,
+      )
     }
 
     if (route === 'gdrive-ensure-folders' && req.method === 'POST') {
@@ -409,10 +627,12 @@ Deno.serve(async (req) => {
         idempotencyKey?: string
         parentFolderId?: string
         parents?: unknown
+        guestName?: string
+        guestMessage?: string
       }
       const sb = adminClient()
-      const { eventId, settings } = await loadEventSettings(sb)
-      const guest = await requireGuest(req, eventId)
+      const { eventId, settings, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
 
       const mediaKind = body.mediaKind === 'video' ? 'video' : 'image'
@@ -531,7 +751,8 @@ Deno.serve(async (req) => {
           mime_type: meta.mimeType,
           upload_status: 'created',
           moderation_status: 'pending',
-          guest_name: (body.filename ?? 'file').slice(0, 180),
+          guest_name: (body.guestName || body.filename || 'Guest').slice(0, 180),
+          guest_message: body.guestMessage?.slice(0, 500) ?? null,
         })
         .select('id')
         .single()
@@ -561,8 +782,8 @@ Deno.serve(async (req) => {
       const sessionId = url.searchParams.get('sessionId')
       if (!sessionId) return json({ error: 'missing_session_id', requestId }, 400, origin, requestId)
       const sb = adminClient()
-      const { eventId } = await loadEventSettings(sb)
-      const guest = await requireGuest(req, eventId)
+      const { eventId, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
       const { data: sess } = await sb
         .from('upload_sessions')
@@ -601,8 +822,8 @@ Deno.serve(async (req) => {
       const body = await req.json() as { sessionId?: string; fileId?: string }
       if (!body.sessionId) return json({ error: 'missing_session_id', requestId }, 400, origin, requestId)
       const sb = adminClient()
-      const { eventId } = await loadEventSettings(sb)
-      const guest = await requireGuest(req, eventId)
+      const { eventId, guestTokenVersion, moderationEnabled } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
 
       const { data: sess } = await sb
@@ -680,6 +901,8 @@ Deno.serve(async (req) => {
         })
         .eq('id', sess.id)
 
+      // Verification required always. Auto-approve only when moderation_enabled=false.
+      const approved = !moderationEnabled
       if (media) {
         await sb
           .from('media')
@@ -689,6 +912,8 @@ Deno.serve(async (req) => {
             size_bytes: Number(meta.size ?? sess.byte_size),
             mime_type: meta.mimeType ?? sess.content_type,
             upload_status: 'uploaded',
+            moderation_status: approved ? 'approved' : 'pending',
+            status: approved ? 'approved' : 'pending',
             updated_at: new Date().toISOString(),
           })
           .eq('id', media.id)
@@ -708,6 +933,7 @@ Deno.serve(async (req) => {
           parentFolderRedacted: redactId(expectedParent),
           private: privacy.private,
           privacyReason: privacy.private ? null : privacy.reason,
+          moderationStatus: approved ? 'approved' : 'pending',
           ownersRedacted: (meta.owners ?? []).map((o) =>
             o.emailAddress ? `${o.emailAddress.slice(0, 2)}…` : '…'
           ),
@@ -762,8 +988,8 @@ Deno.serve(async (req) => {
         return json({ error: 'missing_media_or_bytes', requestId }, 400, origin, requestId)
       }
       const sb = adminClient()
-      const { eventId } = await loadEventSettings(sb)
-      const guest = await requireGuest(req, eventId)
+      const { eventId, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
 
       const { data: media } = await sb
@@ -813,8 +1039,8 @@ Deno.serve(async (req) => {
       const kind = url.searchParams.get('kind') === 'poster' ? 'poster' : 'image'
       if (!mediaId) return json({ error: 'missing_media_id', requestId }, 400, origin, requestId)
       const sb = adminClient()
-      const { eventId } = await loadEventSettings(sb)
-      const guest = await requireGuest(req, eventId)
+      const { eventId, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
       const { data: media } = await sb
         .from('media')
@@ -1033,7 +1259,9 @@ Deno.serve(async (req) => {
   } catch (err) {
     const message = safeErrorMessage(err)
     const status =
-      message.includes('google_drive_disconnected') || message.includes('refresh_token')
+      message.includes('google_drive_reconnect_required')
+        ? 503
+        : message.includes('google_drive_disconnected') || message.includes('refresh_token')
         ? 503
         : message.includes('invalid_grant')
         ? 401
@@ -1044,13 +1272,33 @@ Deno.serve(async (req) => {
       try {
         const sb = adminClient()
         const { eventId } = await loadEventSettings(sb)
-        await sb
-          .from('google_drive_integrations')
-          .update({ status: 'disconnected', last_error: 'invalid_grant', updated_at: new Date().toISOString() })
-          .eq('event_id', eventId)
+        // Pause uploads + mark reconnect-required. Never delete Drive media or preview rows.
+        await markReconnectRequired(sb, eventId)
       } catch {
         /* ignore */
       }
+      return json(
+        {
+          error: 'google_drive_reconnect_required',
+          message: 'Google Drive authorization expired. An administrator must reconnect. Existing memories remain available.',
+          requestId,
+        },
+        503,
+        origin,
+        requestId,
+      )
+    }
+    if (message.includes('google_drive_reconnect_required')) {
+      return json(
+        {
+          error: 'google_drive_reconnect_required',
+          message: 'Google Drive needs administrator reconnect. Uploads are paused; gallery previews remain available.',
+          requestId,
+        },
+        503,
+        origin,
+        requestId,
+      )
     }
     return json({ error: 'internal', message, requestId }, status, origin, requestId)
   }

@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:unit-shared": "node ../supabase/functions/_shared/hardening.node-test.mjs && node ../supabase/functions/_shared/capacity.node-test.mjs && node ../supabase/functions/_shared/admin_auth.node-test.mjs && node ../supabase/functions/_shared/access_code_rotate.node-test.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.4.0",
@@ -26,12 +28,14 @@
     "@fontsource/italiana": "^5.2.8",
     "@fontsource/jura": "^5.2.7",
     "@fontsource/pinyon-script": "^5.2.8",
+    "@playwright/test": "^1.61.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^24.13.2",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "oxlint": "^1.71.0",
+    "playwright": "^1.61.1",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"

@@ -46,9 +46,10 @@ Configurable (DB settings, not baked-in GB totals):
 
 - Never use guest filenames as Drive paths; store sanitized name as metadata only.
 - Collision-resistant server-generated names + Drive file IDs in Postgres.
-- Gallery uses short-lived authorized display URLs (Edge-mediated); no public Drive folder links.
-- Originals for admin only.
-- Do not auto-delete media when capacity is exhausted.
+- Gallery uses short-lived signed URLs from private Supabase Storage bucket `wedding-previews` (not public Drive links).
+- Originals live in private Google Drive folders; gallery never streams originals to guests.
+- On Google `invalid_grant`: mark integration `reconnect_required`, pause uploads, keep previews + Drive media, admin-only reconnect. Guests never authenticate with Google.
+- Do not auto-delete media when capacity is exhausted or authorization expires.
 
 ## Secrets (Edge only)
 

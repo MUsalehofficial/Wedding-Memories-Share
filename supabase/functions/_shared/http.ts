@@ -15,7 +15,7 @@ export function corsHeaders(origin: string | null): HeadersInit {
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Headers':
-      'authorization, x-client-info, apikey, content-type, x-request-id, x-guest-token, x-idempotency-key',
+      'authorization, x-client-info, apikey, content-type, x-request-id, x-guest-token, x-admin-secret, x-idempotency-key',
     'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
     Vary: 'Origin',
   }

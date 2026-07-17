@@ -36,7 +36,7 @@
 
 | Check | Evidence? | Result |
 |-------|-----------|--------|
-| Publishing status (Testing / Production) | **Insufficient** | Not readable via API. **Recorded as wedding-readiness blocker:** confirm in Google Cloud Console → OAuth consent screen. If still **Testing**, move to **Production** or re-consent shortly before the wedding per Google’s testing-token policy. Not a development blocker. |
+| Publishing status (Testing / Production) | **Yes** (operator confirmed) | **In production** as of 2026-07-17. Do not revoke/replace the live refresh token while it remains valid. |
 | Test users | **Insufficient** | Do not publish addresses here. Confirm configured test users in Console if app remains in Testing. |
 | Exact granted scopes | **Yes** — `gdrive-health` / hardening run | `openid` `email` `profile` `https://www.googleapis.com/auth/drive.file` `https://www.googleapis.com/auth/drive.metadata.readonly` |
 | Drive access scope | **Yes** | File create/upload/delete uses **`drive.file` only**. `drive.metadata.readonly` is for `about.get` quota only (not file content access beyond app-created files). |
@@ -186,11 +186,11 @@ Live harness (not committed secrets): `node scripts/gdrive-hardening-live.mjs`
 
 ## Wedding-readiness blockers (remaining)
 
-1. **OAuth consent publishing status** — confirm Testing vs Production in Google Cloud Console; if Testing, Production (or planned re-consent) before wedding.
-2. **Dedicated `GUEST_TOKEN_SIGNING_SECRET`** — set explicitly for production (Edge currently falls back to service role if unset; health may show the dedicated flag).
-3. **Full browser SPA upload** from `localhost:5173` / production origin — CORS + Origin proven via harness; guest uploader UI not built (out of scope).
-4. **Real camera JPEG EXIF-strip proof** — synthetic fixture; regenerate preview from a phone JPEG before wedding if needed.
-5. **Do not start** full guest/admin gallery/slideshow/QR product until you approve this hardening checkpoint.
+1. ~~OAuth consent publishing status~~ — **In production** (confirmed).
+2. **Dedicated `GUEST_TOKEN_SIGNING_SECRET`** — set explicitly for production (Edge may fall back to service role if unset).
+3. **`ADMIN_PANEL_SECRET`** — required for admin reconnect (`x-admin-secret`). If unset, reconnect fails closed. `ADMIN_EMAIL` is never a passphrase.
+4. Change the temporary wedding access code if desired (issued at MVP setup; not stored in the repo).
+5. Full moderation queue / slideshow / QR — later product work.
 
 ---
 

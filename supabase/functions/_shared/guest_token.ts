@@ -24,9 +24,11 @@ export async function mintGuestToken(
   secret: string,
   eventId: string,
   ttlSeconds = 3600,
+  version = 1,
 ): Promise<string> {
   const payload = {
     eventId,
+    v: version,
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
   }
   const body = b64urlJson(payload)
@@ -38,7 +40,8 @@ export async function mintGuestToken(
 export async function verifyGuestToken(
   secret: string,
   token: string | null | undefined,
-): Promise<{ ok: true; eventId: string } | { ok: false; code: string }> {
+  expectedVersion?: number,
+): Promise<{ ok: true; eventId: string; version: number } | { ok: false; code: string }> {
   if (!token || !token.includes('.')) return { ok: false, code: 'guest_token_missing' }
   const [body, sigB64] = token.split('.')
   if (!body || !sigB64) return { ok: false, code: 'guest_token_invalid' }
@@ -62,7 +65,11 @@ export async function verifyGuestToken(
     )
     if (!json.eventId || typeof json.exp !== 'number') return { ok: false, code: 'guest_token_invalid' }
     if (json.exp < Math.floor(Date.now() / 1000)) return { ok: false, code: 'guest_token_expired' }
-    return { ok: true, eventId: json.eventId as string }
+    const version = typeof json.v === 'number' ? json.v : 1
+    if (expectedVersion != null && version !== expectedVersion) {
+      return { ok: false, code: 'guest_token_revoked' }
+    }
+    return { ok: true, eventId: json.eventId as string, version }
   } catch {
     return { ok: false, code: 'guest_token_invalid' }
   }

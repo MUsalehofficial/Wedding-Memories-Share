@@ -6,16 +6,27 @@ Production: https://share-memories-with-us.musalehofficial.com
 
 ## Status
 
-Storage backend: **Google Drive** (R2 / OneDrive superseded).  
-Current gate: [`docs/gdrive-upload-spike.md`](docs/gdrive-upload-spike.md) — live OAuth + `about.get` quota proof.
+- Storage: **Google Drive** originals + private Supabase `wedding-previews`
+- OAuth consent: **In production**
+- Product: Guest upload + gallery MVP (no admin dashboard)
 
-## Stack
+## Guest routes
 
-- Frontend: React, Vite, GitHub Pages
-- Backend: Supabase (`vszfgqylajnvdbjqadjr`)
-- Media: Google Drive via Edge Functions + Vault refresh token
-- Capacity: live `about.get` (never hardcoded GB totals)
+| Path | Purpose |
+|------|---------|
+| `/#/` | Welcome |
+| `/#/access` | Wedding code |
+| `/#/upload` | Multi-file resumable upload |
+| `/#/gallery` | Preview gallery |
+| `/#/privacy` | Privacy |
 
-## Spike UI
+## Operator controls
 
-`/#/admin/spike-upload` · `/#/admin/capacity`
+No public admin UI. Use [`docs/operations.md`](docs/operations.md) and `node scripts/ops.mjs …`.
+
+## Docs
+
+- Capacity: `docs/gdrive-capacity.md`
+- Spike / hardening evidence: `docs/gdrive-upload-spike.md`
+- Environment: `docs/environment.md`
+- Operations: `docs/operations.md`
