@@ -29,9 +29,17 @@ export function googleConfig(): GoogleConfig {
   const clientId = Deno.env.get('GOOGLE_CLIENT_ID')
   const clientSecret = Deno.env.get('GOOGLE_CLIENT_SECRET')
   const redirectUri = Deno.env.get('GOOGLE_REDIRECT_URI')
-  const scopes =
+  const configured =
     Deno.env.get('GOOGLE_SCOPES') ??
     'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly'
+  // about.get requires metadata.readonly (or broader drive); ensure it is always present
+  const required = 'https://www.googleapis.com/auth/drive.metadata.readonly'
+  const scopes = configured.includes('drive.metadata.readonly') ||
+      configured.includes('googleapis.com/auth/drive ') ||
+      configured.endsWith('/auth/drive') ||
+      configured.includes('/auth/drive.readonly')
+    ? configured
+    : `${configured} ${required}`.trim()
   if (!clientId || !clientSecret || !redirectUri) {
     throw new Error('Google OAuth secrets are not configured')
   }

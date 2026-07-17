@@ -98,6 +98,83 @@ async function accessTokenForEvent(sb: ReturnType<typeof adminClient>, eventId: 
   return tokens.access_token
 }
 
+async function finishGoogleOAuth(
+  code: string | null,
+  state: string | null,
+  origin: string | null,
+  requestId: string,
+  htmlOk: boolean,
+): Promise<Response> {
+  if (!code || !state) {
+    return json({ error: 'missing_code_or_state', requestId }, 400, origin, requestId)
+  }
+  const sb = adminClient()
+  const { data: st } = await sb.from('oauth_states').select('state, expires_at').eq('state', state).maybeSingle()
+  await sb.from('oauth_states').delete().eq('state', state)
+  if (!st || new Date(st.expires_at) < new Date()) {
+    return json({ error: 'invalid_state', requestId }, 400, origin, requestId)
+  }
+
+  const tokens = await exchangeGoogleCode(code)
+  if (!tokens.refresh_token) {
+    return json(
+      { error: 'no_refresh_token', message: 'Re-consent with prompt=consent', requestId },
+      400,
+      origin,
+      requestId,
+    )
+  }
+
+  const { eventId } = await loadEventSettings(sb)
+  const { data: secretId, error: vaultErr } = await sb.rpc('wedding_vault_put', {
+    secret_name: `google_refresh_${eventId}`,
+    secret_value: tokens.refresh_token,
+  })
+  if (vaultErr || !secretId) throw vaultErr ?? new Error('vault_put_failed')
+
+  const quota = await fetchDriveQuota(tokens.access_token)
+
+  await sb.from('google_drive_integrations').upsert(
+    {
+      event_id: eventId,
+      status: 'connected',
+      refresh_token_vault_secret_id: secretId,
+      connected_at: new Date().toISOString(),
+      last_token_refresh_at: new Date().toISOString(),
+      last_quota_check_at: new Date().toISOString(),
+      last_quota_limit_bytes: quota.limit,
+      last_quota_usage_bytes: quota.usage,
+      last_successful_api_at: new Date().toISOString(),
+      last_error: null,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'event_id' },
+  )
+
+  const view = {
+    connected: true,
+    quotaBytes: {
+      limit: quota.limit,
+      usage: quota.usage,
+      usageInDrive: quota.usageInDrive,
+      usageInDriveTrash: quota.usageInDriveTrash,
+      maxUploadSize: quota.maxUploadSize,
+    },
+    requestId,
+  }
+
+  if (htmlOk) {
+    return new Response(
+      `<!doctype html><html><body style="font-family:serif;padding:2rem">
+       <p>Google Drive connected. You can close this window.</p>
+       <p>Quota limit bytes: ${quota.limit ?? 'unknown'}</p>
+       </body></html>`,
+      { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
+    )
+  }
+  return json(view, 200, origin, requestId)
+}
+
 Deno.serve(async (req) => {
   const origin = req.headers.get('Origin')
   const requestId = req.headers.get('x-request-id') ?? newRequestId()
@@ -142,61 +219,13 @@ Deno.serve(async (req) => {
     if (route === 'google-callback' && req.method === 'GET') {
       const code = url.searchParams.get('code')
       const state = url.searchParams.get('state')
-      if (!code || !state) {
-        return json({ error: 'missing_code_or_state', requestId }, 400, origin, requestId)
-      }
-      const sb = adminClient()
-      const { data: st } = await sb.from('oauth_states').select('state, expires_at').eq('state', state).maybeSingle()
-      await sb.from('oauth_states').delete().eq('state', state)
-      if (!st || new Date(st.expires_at) < new Date()) {
-        return json({ error: 'invalid_state', requestId }, 400, origin, requestId)
-      }
+      return await finishGoogleOAuth(code, state, origin, requestId, true)
+    }
 
-      const tokens = await exchangeGoogleCode(code)
-      if (!tokens.refresh_token) {
-        return json(
-          { error: 'no_refresh_token', message: 'Re-consent with prompt=consent', requestId },
-          400,
-          origin,
-          requestId,
-        )
-      }
-
-      const { eventId } = await loadEventSettings(sb)
-      const { data: secretId, error: vaultErr } = await sb.rpc('wedding_vault_put', {
-        secret_name: `google_refresh_${eventId}`,
-        secret_value: tokens.refresh_token,
-      })
-      if (vaultErr || !secretId) throw vaultErr ?? new Error('vault_put_failed')
-
-      const access = tokens.access_token
-      const quota = await fetchDriveQuota(access)
-
-      await sb.from('google_drive_integrations').upsert(
-        {
-          event_id: eventId,
-          status: 'connected',
-          refresh_token_vault_secret_id: secretId,
-          connected_at: new Date().toISOString(),
-          last_token_refresh_at: new Date().toISOString(),
-          last_quota_check_at: new Date().toISOString(),
-          last_quota_limit_bytes: quota.limit,
-          last_quota_usage_bytes: quota.usage,
-          last_successful_api_at: new Date().toISOString(),
-          last_error: null,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: 'event_id' },
-      )
-
-      // HTML for browser redirect UX
-      return new Response(
-        `<!doctype html><html><body style="font-family:serif;padding:2rem">
-         <p>Google Drive connected. You can close this window.</p>
-         <p>Quota limit bytes: ${quota.limit ?? 'unknown'}</p>
-         </body></html>`,
-        { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } },
-      )
+    // Spike/network workaround: exchange code when browser cannot reach callback (TLS routing)
+    if (route === 'google-callback-exchange' && req.method === 'POST') {
+      const body = await req.json() as { code?: string; state?: string }
+      return await finishGoogleOAuth(body.code ?? null, body.state ?? null, origin, requestId, false)
     }
 
     if (route === 'gdrive-quota' && req.method === 'GET') {
