@@ -132,10 +132,19 @@ async function completeOriginal(
       method: 'POST',
       guestToken: token,
       functionSlug: 'wedding-resolve-upload',
+      stage: 'resolve_drive_file',
       body: JSON.stringify({ sessionId }),
     })
     resolved = probe.fileId ?? null
     logApi('resolve_upload', { requestId: probe.requestId ?? null, hasFileId: Boolean(resolved) })
+    if (!resolved) {
+      throw new ApiError('resolve_drive_file: missing file id', {
+        status: 502,
+        code: 'missing_file_id',
+        requestId: probe.requestId ?? null,
+        stage: 'resolve_drive_file',
+      })
+    }
   }
   const data = await apiJson<{
     fileId?: string
@@ -144,9 +153,19 @@ async function completeOriginal(
   }>('gdrive-complete-resumable', {
     method: 'POST',
     guestToken: token,
+    stage: 'complete_upload',
     body: JSON.stringify({ sessionId, fileId: resolved || undefined }),
   })
   return { fileId: data.fileId ?? resolved, mediaId: data.mediaId, requestId: data.requestId }
+}
+
+function formatStageError(stage: string, err: unknown): string {
+  if (err instanceof ApiError) {
+    const rid = err.requestId ? ` (request ${err.requestId.slice(0, 8)})` : ''
+    return `${stage}: ${err.code}${rid}`
+  }
+  const msg = err instanceof Error ? err.message : String(err)
+  return `${stage}: ${msg}`
 }
 
 async function uploadPreviewFor(
@@ -159,12 +178,18 @@ async function uploadPreviewFor(
   const mediaKind = job.fileType.startsWith('video/') ? 'video' : 'image'
   onUpdate({ status: 'generating_preview', error: undefined })
   if (mediaKind === 'image') {
-    const preview = await makeImagePreview(job.file)
+    let preview: { blob: Blob; contentType: string }
+    try {
+      preview = await makeImagePreview(job.file)
+    } catch (err) {
+      throw new Error(formatStageError('generating_preview', err))
+    }
     onUpdate({ status: 'uploading_preview' })
     const base64 = await blobToBase64(preview.blob)
     await apiJson('gdrive-upload-preview', {
       method: 'POST',
       guestToken: token,
+      stage: 'uploading_preview',
       body: JSON.stringify({
         mediaId: job.mediaId,
         base64,
@@ -180,6 +205,7 @@ async function uploadPreviewFor(
       await apiJson('gdrive-upload-preview', {
         method: 'POST',
         guestToken: token,
+        stage: 'uploading_preview',
         body: JSON.stringify({
           mediaId: job.mediaId,
           base64,
@@ -205,14 +231,13 @@ async function uploadOne(
     try {
       await uploadPreviewFor(token, job, onUpdate)
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
       logApi('preview_failed', {
         mediaId: job.mediaId,
         requestId: err instanceof ApiError ? err.requestId : null,
       })
       onUpdate({
         status: 'preview_failed',
-        error: 'Original saved; preview failed. ' + msg,
+        error: 'Original saved; preview failed. ' + formatStageError('preview', err),
       })
     }
     return
@@ -226,12 +251,33 @@ async function uploadOne(
     } catch (err) {
       if (err instanceof ApiError && err.code === 'upload_incomplete') {
         logApi('complete_incomplete_resume', { requestId: err.requestId })
-        return uploadOne(token, info, job, name, message, onUpdate, 'full')
+        // Only resume bytes if Drive session is incomplete — never create a new session.
+        return uploadOne(token, info, { ...job, uploadUrl: job.uploadUrl ?? null }, name, message, onUpdate, 'full')
       }
+      onUpdate({
+        status: 'original_failed',
+        error: formatStageError('complete_upload', err),
+        sessionId: job.sessionId,
+        mediaId: job.mediaId,
+      })
       throw err
     }
-    onUpdate({ status: 'original_uploaded', originalVerified: true, progress: 100, uploadUrl: null })
-    await uploadPreviewFor(token, { ...job, originalVerified: true }, onUpdate)
+    onUpdate({
+      status: 'original_uploaded',
+      originalVerified: true,
+      progress: 100,
+      uploadUrl: null,
+    })
+    try {
+      await uploadPreviewFor(token, { ...job, originalVerified: true }, onUpdate)
+    } catch (err) {
+      onUpdate({
+        status: 'preview_failed',
+        error: 'Original saved; preview failed. ' + formatStageError('preview', err),
+        originalVerified: true,
+        progress: 100,
+      })
+    }
     return
   }
 
@@ -319,6 +365,7 @@ async function uploadOne(
     }>('gdrive-create-resumable-session', {
       method: 'POST',
       guestToken: token,
+      stage: 'create_upload_session',
       body: JSON.stringify({
         mimeType: file.type,
         filename: file.name,
@@ -355,7 +402,7 @@ async function uploadOne(
   }
 
   if (!uploadUrl) {
-    // Session open on server but URL missing — try complete (idempotent) if bytes already on Drive
+    // Session exists but URL withheld (or cleared) — resolve + complete only (no new Drive original)
     onUpdate({ status: 'completing' })
     try {
       const done = await completeOriginal(token, sessionId!, fileId)
@@ -382,7 +429,9 @@ async function uploadOne(
     } catch (err) {
       onUpdate({
         status: 'original_failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: formatStageError('complete_upload', err),
+        sessionId,
+        mediaId,
       })
       throw err
     }
@@ -395,6 +444,42 @@ async function uploadOne(
     resumeFrom = 0
   }
 
+  // If a prior attempt already finished the resumable session, skip PUT and resolve/complete only.
+  if (resumeFrom >= file.size && file.size > 0) {
+    onUpdate({ status: 'completing', progress: 100, sessionId, mediaId })
+    try {
+      const done = await completeOriginal(token, sessionId!, null)
+      onUpdate({
+        status: 'original_uploaded',
+        originalVerified: true,
+        fileId: done.fileId,
+        mediaId: done.mediaId ?? mediaId,
+        progress: 100,
+        uploadUrl: null,
+      })
+      await uploadPreviewFor(
+        token,
+        {
+          ...job,
+          sessionId: sessionId!,
+          mediaId: done.mediaId ?? mediaId,
+          originalVerified: true,
+          file,
+        },
+        onUpdate,
+      )
+      return
+    } catch (err) {
+      onUpdate({
+        status: 'original_failed',
+        error: formatStageError('complete_upload', err),
+        sessionId,
+        mediaId,
+      })
+      throw err
+    }
+  }
+
   try {
     const put = await putResumableFile(
       uploadUrl,
@@ -403,11 +488,13 @@ async function uploadOne(
       resumeFrom,
     )
     fileId = put.fileId
-    onUpdate({ fileId, status: 'completing', progress: 100 })
+    onUpdate({ fileId, status: 'completing', progress: 100, sessionId, mediaId })
   } catch (err) {
     onUpdate({
       status: 'original_failed',
-      error: err instanceof Error ? err.message : String(err),
+      error: formatStageError('uploading_original', err),
+      sessionId,
+      mediaId,
     })
     throw err
   }
@@ -423,10 +510,10 @@ async function uploadOne(
       uploadUrl: null,
     })
   } catch (err) {
-    // Original may exist on Drive; keep session/media ids for idempotent retry of complete only
+    // Original may exist on Drive; keep session/media ids for idempotent complete-only retry
     onUpdate({
       status: 'original_failed',
-      error: err instanceof Error ? err.message : String(err),
+      error: formatStageError('complete_upload', err),
       sessionId,
       mediaId,
       fileId,
@@ -447,10 +534,9 @@ async function uploadOne(
       onUpdate,
     )
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
     onUpdate({
       status: 'preview_failed',
-      error: 'Original saved; preview failed. ' + msg,
+      error: 'Original saved; preview failed. ' + formatStageError('preview', err),
       sessionId,
       mediaId,
       originalVerified: true,
@@ -592,13 +678,11 @@ export function UploadPage() {
     for (const job of jobs) {
       if (job.status === 'completed') continue
       const mode =
-        job.status === 'preview_failed'
+        job.status === 'preview_failed' || job.originalVerified
           ? 'preview'
-          : job.originalVerified
-            ? 'preview'
-            : job.status === 'original_failed' && job.sessionId && !job.uploadUrl
-              ? 'complete'
-              : 'full'
+          : job.status === 'original_failed' && job.sessionId
+            ? 'complete'
+            : 'full'
       try {
         await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
       } catch (err) {
@@ -619,9 +703,11 @@ export function UploadPage() {
     const mode: 'full' | 'preview' | 'complete' =
       job.status === 'preview_failed' || (job.originalVerified && !job.hasPreview)
         ? 'preview'
-        : job.sessionId && job.originalVerified === false && job.status === 'original_failed'
+        : job.sessionId && job.status === 'original_failed'
           ? 'complete'
-          : 'full'
+          : job.sessionId && !job.originalVerified && job.progress >= 100
+            ? 'complete'
+            : 'full'
     try {
       await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
     } catch (err) {

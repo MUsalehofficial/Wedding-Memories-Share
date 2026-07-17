@@ -38,13 +38,17 @@ export async function putResumableFile(
         },
         body: chunk,
       })
-    } catch {
+    } catch (err) {
       // ponytail: final-chunk CORS blind spot — Drive may already have the object
-      if (isFinal) {
-        onProgress?.({ uploaded: file.size, total: file.size })
-        return { fileId: null }
+      // Safari often surfaces this as "Load failed"
+      const msg = err instanceof Error ? err.message : String(err)
+      if (isFinal || /load failed|failed to fetch|networkerror|cors/i.test(msg)) {
+        if (isFinal) {
+          onProgress?.({ uploaded: file.size, total: file.size })
+          return { fileId: null }
+        }
       }
-      throw new Error('upload_network_error')
+      throw new Error(`upload_network_error:${msg}`)
     }
     if (res.status === 308) {
       offset = end + 1
