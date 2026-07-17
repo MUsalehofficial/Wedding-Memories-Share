@@ -3,6 +3,7 @@ import { WelcomePage } from '../pages/WelcomePage'
 import { AccessCodePage } from '../pages/AccessCodePage'
 import { SpikeUploadPage } from '../pages/SpikeUploadPage'
 import { AdminLoginPage } from '../pages/AdminLoginPage'
+import { AdminCapacityPage } from '../pages/AdminCapacityPage'
 import { OfflinePage } from '../pages/OfflinePage'
 import { PrivacyPage } from '../pages/PrivacyPage'
 
@@ -15,7 +16,7 @@ export function AppRouter() {
         <Route path="/privacy" element={<PrivacyPage />} />
         <Route path="/offline" element={<OfflinePage />} />
         <Route path="/admin" element={<AdminLoginPage />} />
-        {/* Spike-only route — remove after R2 POC is proven */}
+        <Route path="/admin/capacity" element={<AdminCapacityPage />} />
         <Route path="/admin/spike-upload" element={<SpikeUploadPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

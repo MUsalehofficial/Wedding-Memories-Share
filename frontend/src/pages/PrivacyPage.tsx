@@ -9,7 +9,7 @@ export function PrivacyPage() {
         <div className="mt-6 space-y-4 text-lg leading-relaxed text-mist">
           <p>
             This site is for Muhammad and Basmala&apos;s wedding guests only. Photos and short videos
-            you share are stored in the couple&apos;s private cloud storage (Cloudflare R2), not on a
+            you share are stored in the couple&apos;s private Google Drive, not on a
             public album.
           </p>
           <p>

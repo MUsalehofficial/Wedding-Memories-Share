@@ -2,36 +2,20 @@
 
 Private wedding photo & video sharing for **Muhammad & Basmala**.
 
-Production: https://share-memories-with-us.musalehofficial.com  
-Visual reference: https://muhammad-and-basmala-wedding-invitation.musalehofficial.com/
+Production: https://share-memories-with-us.musalehofficial.com
 
 ## Status
 
-Supabase project `vszfgqylajnvdbjqadjr` is live. **R2 upload spike** is the current gate (OneDrive was superseded).
-
-## Docs
-
-| Doc | Purpose |
-|-----|---------|
-| [docs/architecture.md](docs/architecture.md) | System design (R2) |
-| [docs/r2-upload-spike.md](docs/r2-upload-spike.md) | Upload POC + evidence |
-| [docs/r2-cors.md](docs/r2-cors.md) | Bucket CORS policy |
-| [docs/reference-design-audit.md](docs/reference-design-audit.md) | Invitation design tokens |
-| [docs/onedrive-upload-spike.md](docs/onedrive-upload-spike.md) | Historical — superseded |
+Storage backend: **Google Drive** (R2 / OneDrive superseded).  
+Current gate: [`docs/gdrive-upload-spike.md`](docs/gdrive-upload-spike.md) — live OAuth + `about.get` quota proof.
 
 ## Stack
 
-- Frontend: React, TypeScript, Vite, Tailwind, HashRouter (GitHub Pages)
-- Backend: Supabase (Postgres, Auth, Edge Functions)
-- Media: **Cloudflare R2** (private bucket, presigned URLs)
+- Frontend: React, Vite, GitHub Pages
+- Backend: Supabase (`vszfgqylajnvdbjqadjr`)
+- Media: Google Drive via Edge Functions + Vault refresh token
+- Capacity: live `about.get` (never hardcoded GB totals)
 
-## Local frontend
+## Spike UI
 
-```bash
-cd frontend
-cp ../docs/environment.md # use as guide for .env
-npm install
-npm run dev
-```
-
-Spike UI: `/#/admin/spike-upload`
+`/#/admin/spike-upload` · `/#/admin/capacity`
