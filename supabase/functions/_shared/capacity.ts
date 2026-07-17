@@ -13,6 +13,9 @@ export type CapacitySettings = {
   videoUploadsEnabled: boolean
   warnRatio: number
   criticalRatio: number
+  uploadsEnabled?: boolean
+  maxImageBytes?: number
+  maxVideoBytes?: number
 }
 
 export type CapacityLevel = 'ok' | 'warn' | 'critical' | 'full' | 'unknown'
@@ -72,6 +75,13 @@ export function canCreateOriginalUpload(
   fileBytes: number,
   mediaKind: 'image' | 'video',
 ): UploadGate {
+  if (settings.uploadsEnabled === false) {
+    return {
+      ok: false,
+      code: 'uploads_disabled',
+      message: 'Uploads are temporarily disabled by the administrator.',
+    }
+  }
   if (mediaKind === 'video' && !settings.videoUploadsEnabled) {
     return {
       ok: false,

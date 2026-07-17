@@ -4,6 +4,7 @@
  */
 
 import { parseQuota, type DriveQuota } from './capacity.ts'
+import { nextOffsetFromRange } from './chunks.ts'
 
 const AUTH = 'https://oauth2.googleapis.com'
 const DRIVE = 'https://www.googleapis.com/drive/v3'
@@ -204,10 +205,42 @@ export async function uploadFileMultipart(
 export async function getFileMetadata(accessToken: string, fileId: string) {
   const res = await driveFetch(
     accessToken,
-    `${DRIVE}/files/${fileId}?fields=id,name,size,mimeType,trashed`,
+    `${DRIVE}/files/${fileId}?fields=id,name,size,mimeType,trashed,md5Checksum,parents,owners(emailAddress)`,
   )
   if (!res.ok) throw new Error(`files.get failed (${res.status})`)
-  return await res.json() as { id: string; name: string; size?: string; mimeType?: string; trashed?: boolean }
+  return await res.json() as {
+    id: string
+    name: string
+    size?: string
+    mimeType?: string
+    trashed?: boolean
+    md5Checksum?: string
+    parents?: string[]
+    owners?: { emailAddress?: string }[]
+  }
+}
+
+export async function listFilePermissions(accessToken: string, fileId: string) {
+  const res = await driveFetch(
+    accessToken,
+    `${DRIVE}/files/${fileId}/permissions?fields=permissions(id,type,role,allowFileDiscovery)`,
+  )
+  if (!res.ok) throw new Error(`permissions.list failed (${res.status})`)
+  const data = await res.json() as {
+    permissions?: { id: string; type: string; role: string; allowFileDiscovery?: boolean }[]
+  }
+  return data.permissions ?? []
+}
+
+export function assertPrivatePermissions(
+  permissions: { type: string; role: string }[],
+): { private: true } | { private: false; reason: string } {
+  for (const p of permissions) {
+    if (p.type === 'anyone' || p.type === 'domain') {
+      return { private: false, reason: `shared_${p.type}` }
+    }
+  }
+  return { private: true }
 }
 
 export async function deleteDriveFile(accessToken: string, fileId: string) {
@@ -217,6 +250,30 @@ export async function deleteDriveFile(accessToken: string, fileId: string) {
 
 export async function downloadDriveFile(accessToken: string, fileId: string): Promise<Response> {
   return await driveFetch(accessToken, `${DRIVE}/files/${fileId}?alt=media`)
+}
+
+/** Query resumable upload progress. Returns next byte offset (0 if empty). */
+export async function queryResumableOffset(
+  uploadUrl: string,
+  totalBytes: number,
+): Promise<{ status: number; range: string | null; nextOffset: number }> {
+  const res = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: {
+      'Content-Length': '0',
+      'Content-Range': `bytes */${totalBytes}`,
+    },
+  })
+  const range = res.headers.get('Range')
+  if (res.status === 200 || res.status === 201) {
+    return { status: res.status, range, nextOffset: totalBytes }
+  }
+  // 308 Resume Incomplete — partial or empty
+  return {
+    status: res.status,
+    range,
+    nextOffset: nextOffsetFromRange(range) ?? 0,
+  }
 }
 
 export async function ensureFolder(
@@ -250,4 +307,42 @@ export async function ensureFolder(
   if (!created.ok) throw new Error(`folder create failed (${created.status})`)
   const folder = await created.json() as { id: string }
   return folder.id
+}
+
+export type WeddingFolderIds = {
+  rootFolderId: string
+  originalsFolderId: string
+  originalsImagesFolderId: string
+  originalsVideosFolderId: string
+  exportsFolderId: string
+}
+
+/** Bootstrap once; callers must persist IDs and reuse them (no per-upload name search). */
+export async function ensureWeddingFolderTree(accessToken: string): Promise<WeddingFolderIds> {
+  const rootFolderId = await ensureFolder(accessToken, 'Wedding Memories')
+  const originalsFolderId = await ensureFolder(accessToken, 'Originals', rootFolderId)
+  const originalsImagesFolderId = await ensureFolder(accessToken, 'Images', originalsFolderId)
+  const originalsVideosFolderId = await ensureFolder(accessToken, 'Videos', originalsFolderId)
+  const exportsFolderId = await ensureFolder(accessToken, 'Exports', rootFolderId)
+  return {
+    rootFolderId,
+    originalsFolderId,
+    originalsImagesFolderId,
+    originalsVideosFolderId,
+    exportsFolderId,
+  }
+}
+
+export function redactId(id: string): string {
+  if (id.length <= 12) return '…'
+  return `${id.slice(0, 8)}…${id.slice(-4)}`
+}
+
+export function redactUploadUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    return `${u.origin}${u.pathname.slice(0, 24)}…`
+  } catch {
+    return '[redacted-upload-url]'
+  }
 }
