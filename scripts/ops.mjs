@@ -123,6 +123,10 @@ const commands = {
   hide-media <id> | delete-media <id>
   quota | clean-abandoned | reconcile [--apply]
   rotate-access-code   # prompt/stdin twice; never pass code as argv
+  create-qr-invite     # prints guest URL once; stores hash only
+  revoke-qr-invites    # revoke all active QR invites (OPS_CONFIRM=YES)
+  list-qr-invites      # metadata only — never raw tokens
+  generate-qr          # stdin: invite URL → PNG+SVG under /tmp (not committed)
 `)
   },
 
@@ -165,6 +169,146 @@ const commands = {
         hash_stored: true,
         salt_stored: true,
         raw_code_logged: false,
+      }),
+    )
+  },
+
+  async 'create-qr-invite'() {
+    if (args.length > 0) {
+      console.error(
+        'Refusing: do not pass the invite token or URL as a command-line argument.\n' +
+          'Use: node scripts/ops.mjs create-qr-invite',
+      )
+      process.exit(2)
+    }
+    const e = await eventRow()
+    const raw = randomBytes(32).toString('base64url')
+    const tokenHash = createHash('sha256').update(raw, 'utf8').digest('hex')
+    // Default: 180 days (override with QR_INVITE_EXPIRES_AT=ISO-8601)
+    const expiresAt = process.env.QR_INVITE_EXPIRES_AT
+      ? new Date(process.env.QR_INVITE_EXPIRES_AT)
+      : new Date(Date.now() + 180 * 24 * 3600 * 1000)
+    if (Number.isNaN(expiresAt.getTime())) {
+      console.error('Invalid QR_INVITE_EXPIRES_AT')
+      process.exit(2)
+    }
+    const rows = await rest('qr_invite_tokens', {
+      method: 'POST',
+      body: JSON.stringify({
+        event_id: e.id,
+        token_hash: tokenHash,
+        expires_at: expiresAt.toISOString(),
+        enabled: true,
+      }),
+    })
+    const id = rows?.[0]?.id
+    const origin = (process.env.GUEST_APP_ORIGIN || 'https://share-memories-with-us.musalehofficial.com').replace(
+      /\/$/,
+      '',
+    )
+    const guestUrl = `${origin}/#/join/${raw}`
+    console.log(guestUrl)
+    console.error(
+      JSON.stringify({
+        ok: true,
+        operation: 'create-qr-invite',
+        invite_id: id,
+        expires_at: expiresAt.toISOString(),
+        raw_token_logged: false,
+        url_printed_once: true,
+      }),
+    )
+  },
+
+  async 'revoke-qr-invites'() {
+    confirmDestructive()
+    const e = await eventRow()
+    const now = new Date().toISOString()
+    const rows = await rest(
+      `qr_invite_tokens?event_id=eq.${e.id}&enabled=eq.true&revoked_at=is.null`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: false, revoked_at: now }),
+      },
+    )
+    console.log(
+      JSON.stringify({
+        ok: true,
+        operation: 'revoke-qr-invites',
+        revoked_count: Array.isArray(rows) ? rows.length : 0,
+      }),
+    )
+  },
+
+  async 'list-qr-invites'() {
+    const e = await eventRow()
+    const rows = await rest(
+      `qr_invite_tokens?event_id=eq.${e.id}&select=id,created_at,expires_at,revoked_at,use_count,enabled&order=created_at.desc`,
+    )
+    console.log(
+      JSON.stringify(
+        (rows || []).map((r) => ({
+          id: r.id,
+          created_at: r.created_at,
+          expires_at: r.expires_at,
+          revoked_at: r.revoked_at,
+          use_count: r.use_count,
+          enabled: r.enabled,
+          status: !r.enabled || r.revoked_at
+            ? 'revoked'
+            : new Date(r.expires_at) <= new Date()
+              ? 'expired'
+              : 'active',
+        })),
+        null,
+        2,
+      ),
+    )
+  },
+
+  async 'generate-qr'() {
+    if (args.length > 0) {
+      console.error('Refusing: pass the invite URL on stdin, not as an argument.')
+      process.exit(2)
+    }
+    const rl = createInterface({ input, output: stderr, terminal: false })
+    const url = await new Promise((resolve) => {
+      stderr.write('Invite URL (paste once): ')
+      rl.once('line', (line) => {
+        rl.close()
+        resolve(String(line || '').trim())
+      })
+    })
+    if (!url || !url.includes('#/join/')) {
+      console.error('Expected a guest invite URL containing #/join/<token>')
+      process.exit(2)
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15)
+    const png = `/tmp/wedding-qr-${stamp}.png`
+    const svg = `/tmp/wedding-qr-${stamp}.svg`
+    const { spawnSync } = await import('node:child_process')
+    // ponytail: npx qrcode — no repo dependency; do not commit outputs
+    const pngRun = spawnSync('npx', ['--yes', 'qrcode', '-o', png, '-w', '1024', url], {
+      encoding: 'utf8',
+    })
+    if (pngRun.status !== 0) {
+      console.error(pngRun.stderr || pngRun.stdout || 'qrcode png failed')
+      process.exit(1)
+    }
+    const svgRun = spawnSync('npx', ['--yes', 'qrcode', '-t', 'svg', '-o', svg, url], {
+      encoding: 'utf8',
+    })
+    if (svgRun.status !== 0) {
+      console.error(svgRun.stderr || svgRun.stdout || 'qrcode svg failed')
+      process.exit(1)
+    }
+    console.log(
+      JSON.stringify({
+        ok: true,
+        operation: 'generate-qr',
+        png,
+        svg,
+        note: 'Do not commit these files — the QR grants guest access.',
       }),
     )
   },

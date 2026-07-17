@@ -23,6 +23,10 @@ OPS_CONFIRM=YES node scripts/ops.mjs clean-abandoned
 node scripts/ops.mjs reconcile              # report-only
 OPS_CONFIRM=YES node scripts/ops.mjs reconcile --apply
 node scripts/ops.mjs rotate-access-code     # prompts twice (no echo); or pipe two matching lines on stdin
+node scripts/ops.mjs create-qr-invite       # prints guest URL once; stores hash only
+node scripts/ops.mjs list-qr-invites
+OPS_CONFIRM=YES node scripts/ops.mjs revoke-qr-invites
+node scripts/ops.mjs generate-qr            # stdin: invite URL → PNG+SVG in /tmp
 ```
 
 ### Rotate wedding access code
@@ -36,6 +40,16 @@ node scripts/ops.mjs rotate-access-code
 ```
 
 Stores only a fresh salt + SHA-256 hash, increments `guest_token_version` (revokes existing guest sessions), and prints a sanitized result (no raw code).
+
+Does **not** automatically revoke QR invite tokens — see `docs/qr-access.md`.
+
+## QR automatic access
+
+See **`docs/qr-access.md`** for create / revoke / print / retirement. Guest URL shape:
+
+`https://share-memories-with-us.musalehofficial.com/#/join/<INVITE_TOKEN>`
+
+Manual fallback: `/#/access`.
 
 ## Google Drive reconnect
 

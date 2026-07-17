@@ -7,7 +7,7 @@ export function allowedOrigins(): string[] {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
-  return [PROD_ORIGIN, 'http://localhost:5173', 'http://127.0.0.1:5173', ...extra]
+  return [PROD_ORIGIN, 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:4173', 'http://127.0.0.1:4173', ...extra]
 }
 
 export function corsHeaders(origin: string | null): HeadersInit {
