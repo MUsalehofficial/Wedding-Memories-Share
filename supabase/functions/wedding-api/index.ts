@@ -10,6 +10,12 @@ import { mintGuestToken, verifyGuestToken } from '../_shared/guest_token.ts'
 import { previewObjectPath, validateUploadMeta } from '../_shared/upload_validation.ts'
 import { hashAccessCode, timingSafeEqual } from '../_shared/access_code.ts'
 import { adminSecretConfigured, resolveAdminAuth } from '../_shared/admin_auth.ts'
+import {
+  checkInviteRateLimit,
+  hashInviteToken,
+  inviteHashMatches,
+  inviteTokenValid,
+} from '../_shared/invite_token.ts'
 import { isDriveUploadBlocked, markReconnectRequired } from '../_shared/reconnect.ts'
 import {
   assertPrivatePermissions,
@@ -517,6 +523,49 @@ Deno.serve(async (req) => {
       }
       const token = await mintGuestToken(guestSecret(), eventId, 60 * 60 * 12, guestTokenVersion)
       return json({ ok: true, guestToken: token, expiresInSec: 60 * 60 * 12, requestId }, 200, origin, requestId)
+    }
+
+    if (route === 'exchange-invite-token' && req.method === 'POST') {
+      const clientKey =
+        req.headers.get('cf-connecting-ip') ??
+        req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+        'unknown'
+      const limited = checkInviteRateLimit(`invite:${clientKey}`)
+      if (!limited.ok) {
+        return json({ error: 'rate_limited', message: 'Too many attempts. Try again shortly.', requestId }, 429, origin, requestId)
+      }
+
+      const body = await req.json() as { token?: string }
+      const raw = (body.token ?? '').trim()
+      if (!raw || raw.length < 32) {
+        return json({ error: 'invalid_invite', requestId }, 401, origin, requestId)
+      }
+
+      const sb = adminClient()
+      const { eventId, guestTokenVersion } = await loadEventSettings(sb)
+      // Event presence via loadEventSettings — slug alone is never authorization.
+      const computed = await hashInviteToken(raw)
+      const { data: row } = await sb
+        .from('qr_invite_tokens')
+        .select('id, event_id, token_hash, enabled, revoked_at, expires_at, use_count')
+        .eq('token_hash', computed)
+        .maybeSingle()
+
+      if (!row || row.event_id !== eventId || !inviteHashMatches(row.token_hash, computed)) {
+        return json({ error: 'invalid_invite', requestId }, 401, origin, requestId)
+      }
+      const validity = inviteTokenValid(row)
+      if (!validity.ok) {
+        return json({ error: validity.code, requestId }, 401, origin, requestId)
+      }
+
+      await sb
+        .from('qr_invite_tokens')
+        .update({ use_count: Number(row.use_count ?? 0) + 1 })
+        .eq('id', row.id)
+
+      const guestToken = await mintGuestToken(guestSecret(), eventId, 60 * 60 * 12, guestTokenVersion)
+      return json({ ok: true, guestToken, expiresInSec: 60 * 60 * 12, requestId }, 200, origin, requestId)
     }
 
     if (route === 'gallery' && req.method === 'GET') {

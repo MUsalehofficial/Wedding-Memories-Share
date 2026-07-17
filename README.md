@@ -15,7 +15,8 @@ Production: https://share-memories-with-us.musalehofficial.com
 | Path | Purpose |
 |------|---------|
 | `/#/` | Welcome |
-| `/#/access` | Wedding code |
+| `/#/join/<token>` | QR automatic guest access (opaque invite) |
+| `/#/access` | Manual wedding code (fallback) |
 | `/#/upload` | Multi-file resumable upload |
 | `/#/gallery` | Preview gallery |
 | `/#/privacy` | Privacy |
@@ -30,3 +31,4 @@ No public admin UI. Use [`docs/operations.md`](docs/operations.md) and `node scr
 - Spike / hardening evidence: `docs/gdrive-upload-spike.md`
 - Environment: `docs/environment.md`
 - Operations: `docs/operations.md`
+- QR access: `docs/qr-access.md`
