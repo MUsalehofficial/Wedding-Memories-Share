@@ -15,7 +15,7 @@ export function AppRouter() {
         <Route path="/privacy" element={<PrivacyPage />} />
         <Route path="/offline" element={<OfflinePage />} />
         <Route path="/admin" element={<AdminLoginPage />} />
-        {/* Spike-only route — remove after OneDrive POC is proven */}
+        {/* Spike-only route — remove after R2 POC is proven */}
         <Route path="/admin/spike-upload" element={<SpikeUploadPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>

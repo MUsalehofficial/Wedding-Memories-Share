@@ -1,9 +1,10 @@
 # Wedding readiness checklist
 
-- [ ] OneDrive connected
-- [ ] Folder structure created (`/Wedding Memories/...`)
-- [ ] Upload proof completed (`docs/onedrive-upload-spike.md` evidence filled)
-- [ ] Microsoft token refresh tested
+- [ ] Cloudflare R2 bucket `wedding-memories` created (private)
+- [ ] R2 CORS configured (`docs/r2-cors.md`)
+- [ ] R2 Edge secrets set
+- [ ] Upload proof completed (`docs/r2-upload-spike.md` evidence filled)
+- [ ] Token/presign expiry tested
 - [ ] 100-photo load test
 - [ ] Concurrent guest test
 - [ ] Video test
@@ -12,7 +13,7 @@
 - [ ] QR code generated (URL must **not** contain the code)
 - [ ] Admin login tested
 - [ ] Disable-upload emergency switch tested
-- [ ] OneDrive free capacity verified
+- [ ] R2 storage capacity verified
 - [ ] Gallery displayed on venue screen (slideshow)
 - [ ] HTTPS enabled
 - [ ] Custom domain working

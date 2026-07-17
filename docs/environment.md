@@ -1,26 +1,26 @@
 # Environment variables
 
-Copy into a local `.env` for the frontend (never commit secrets).
-
 ## Frontend (publishable only)
 
 ```bash
-VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
-VITE_SUPABASE_ANON_KEY=YOUR_PUBLISHABLE_KEY
+VITE_SUPABASE_URL=https://vszfgqylajnvdbjqadjr.supabase.co
+VITE_SUPABASE_ANON_KEY=<publishable or legacy anon key from dashboard>
 VITE_APP_ORIGIN=http://localhost:5173
 ```
 
 ## Edge Function secrets
 
-Set with `supabase secrets set` — never commit:
+Set in Dashboard → Edge Functions → Secrets, or:
 
+```bash
+npx supabase secrets set --project-ref vszfgqylajnvdbjqadjr \
+  R2_ACCOUNT_ID=... \
+  R2_ACCESS_KEY_ID=... \
+  R2_SECRET_ACCESS_KEY=... \
+  R2_BUCKET_NAME=wedding-memories \
+  R2_S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com \
+  ADMIN_EMAIL=you@example.com \
+  GUEST_TOKEN_SIGNING_SECRET=<long-random>
 ```
-MICROSOFT_CLIENT_ID
-MICROSOFT_CLIENT_SECRET
-MICROSOFT_AUTHORITY=https://login.microsoftonline.com/common
-MICROSOFT_REDIRECT_URI=https://YOUR_PROJECT.supabase.co/functions/v1/wedding-api/microsoft-callback
-MICROSOFT_SCOPES=Files.ReadWrite offline_access openid profile
-ADMIN_EMAIL
-GUEST_TOKEN_SIGNING_SECRET
-ALLOWED_ORIGINS=https://share-memories-with-us.musalehofficial.com,http://localhost:5173
-```
+
+Never commit secrets. Microsoft / OneDrive secrets are **not** used (integration superseded).

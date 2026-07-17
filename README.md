@@ -7,35 +7,31 @@ Visual reference: https://muhammad-and-basmala-wedding-invitation.musalehofficia
 
 ## Status
 
-Phase 0 complete (inventory, design audit, implementation plan, OneDrive spike plan).  
-OneDrive upload spike is the next gate — requires a Supabase project and Microsoft Entra app credentials before live proof.
+Supabase project `vszfgqylajnvdbjqadjr` is live. **R2 upload spike** is the current gate (OneDrive was superseded).
 
 ## Docs
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/repository-inventory.md](docs/repository-inventory.md) | What was in the repo at start |
-| [docs/reference-design-audit.md](docs/reference-design-audit.md) | Extracted invitation design tokens |
-| [docs/implementation-plan.md](docs/implementation-plan.md) | Phased build plan |
-| [docs/onedrive-upload-spike.md](docs/onedrive-upload-spike.md) | Upload POC plan + evidence |
+| [docs/architecture.md](docs/architecture.md) | System design (R2) |
+| [docs/r2-upload-spike.md](docs/r2-upload-spike.md) | Upload POC + evidence |
+| [docs/r2-cors.md](docs/r2-cors.md) | Bucket CORS policy |
+| [docs/reference-design-audit.md](docs/reference-design-audit.md) | Invitation design tokens |
+| [docs/onedrive-upload-spike.md](docs/onedrive-upload-spike.md) | Historical — superseded |
 
 ## Stack
 
 - Frontend: React, TypeScript, Vite, Tailwind, HashRouter (GitHub Pages)
-- Backend: Supabase (Postgres, Auth, Edge Functions, Vault)
-- Media: Microsoft OneDrive via Graph (not Supabase Storage)
+- Backend: Supabase (Postgres, Auth, Edge Functions)
+- Media: **Cloudflare R2** (private bucket, presigned URLs)
 
 ## Local frontend
 
 ```bash
 cd frontend
+cp ../docs/environment.md # use as guide for .env
 npm install
 npm run dev
 ```
 
-## Principles
-
-- Single wedding, single admin — no SaaS multi-tenancy
-- Guests use a wedding access code (never shipped in the JS bundle)
-- Originals and previews live in OneDrive; Supabase stores metadata only
-- Secrets stay in Edge Function / Vault configuration
+Spike UI: `/#/admin/spike-upload`

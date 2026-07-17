@@ -4,16 +4,16 @@
 
 - Guests are untrusted devices on public networks.
 - One administrator account (email allowlisted).
-- Media is sensitive (faces, location EXIF in originals).
+- Media is sensitive (faces; strip GPS from previews).
 
 ## Hard rules
 
 1. Never put the wedding access code in the frontend bundle, QR URL, GitHub Actions, or public tables.
-2. Never expose Microsoft client secret, access tokens, refresh tokens, guest signing secret, or Supabase service-role key to the browser.
+2. Never expose R2 access keys, Supabase service-role key, or guest signing secret to the browser.
 3. Store only hashes of access codes and guest session tokens.
-4. Store Microsoft refresh tokens in Supabase Vault; replace on rotation; never log.
-5. Guests never receive original-file download links; gallery uses temporary authorized display URLs for previews only.
-6. Edge Function CORS is restricted to the production origin and explicit local origins.
+4. Guests receive short-lived presigned GET URLs for **previews** only — never permanent object URLs or originals.
+5. Edge Function CORS is restricted to the production origin and explicit local origins.
+6. R2 bucket stays private; no public access; no guest bucket listing.
 7. Admin destructive actions require confirmation and write `admin_audit_log`.
 
 ## Guest session
@@ -22,12 +22,12 @@
 2. Browser sends token on guest APIs; server verifies hash + expiry + revocation.
 3. Admin can revoke all guest sessions.
 
-## OneDrive
+## Cloudflare R2
 
-- Delegated Graph `Files.ReadWrite` + `offline_access`.
-- On `invalid_grant`, mark integration disconnected and require reconnect.
-- Never trust client-supplied OneDrive paths; server resolves folder IDs.
+- Presigned PUT bound to `Content-Type`, short expiry (~5 minutes).
+- Complete path verifies with `HeadObject` before marking uploaded.
+- Delete only via secured admin/Edge paths.
 
-## Reporting
+## Historical note
 
-Treat this as a private wedding site. If you find a vulnerability during setup, fix it before the wedding weekend and rotate the access code + Microsoft connection.
+OneDrive / Microsoft Graph was cancelled before production use. See `docs/onedrive-upload-spike.md` (superseded).
