@@ -1,0 +1,148 @@
+/* Extracted from muhammad-and-basmala-wedding-invitation — see docs/reference-design-audit.md */
+:root {
+  --lux-gold: #b8863b;
+  --lux-gold-dark: #7a5528;
+  --lux-beige: #d8c7a3;
+
+  --background: 36 24% 97%;
+  --foreground: 22 22% 18%;
+  --card: 0 0% 100%;
+  --card-foreground: 22 22% 18%;
+  --primary: 30 36% 28%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 35 28% 92%;
+  --secondary-foreground: 22 22% 18%;
+  --muted: 35 26% 93%;
+  --muted-foreground: 24 14% 40%;
+  --accent: 34 32% 90%;
+  --accent-foreground: 22 22% 18%;
+  --border: 34 24% 78%;
+  --input: 34 24% 78%;
+  --ring: 30 36% 28%;
+  --radius: 0.55rem;
+
+  --candle: 34 32% 40%;
+  --candle-soft: 30 30% 24%;
+  --gold-line: 34 22% 62%;
+  --mist: 24 16% 34%;
+  --night: 36 24% 97%;
+  --night-soft: 0 0% 100%;
+  --velvet: 34 24% 94%;
+
+  --font-display: 'Italiana', 'Cormorant Garamond', serif;
+  --font-body: 'Cormorant Garamond', Georgia, serif;
+  --font-script: 'Pinyon Script', cursive;
+  --font-label: 'Jura', system-ui, sans-serif;
+
+  --ease-editorial: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+  --color-card: hsl(var(--card));
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-border: hsl(var(--border));
+  --color-ring: hsl(var(--ring));
+  --color-lux-gold: var(--lux-gold);
+  --color-lux-gold-dark: var(--lux-gold-dark);
+  --color-lux-beige: var(--lux-beige);
+  --color-candle: hsl(var(--candle));
+  --color-candle-soft: hsl(var(--candle-soft));
+  --color-mist: hsl(var(--mist));
+  --font-display: var(--font-display);
+  --font-body: var(--font-body);
+  --font-script: var(--font-script);
+  --font-label: var(--font-label);
+  --radius-lg: var(--radius);
+}
+
+.invite-linen {
+  background-color: #faf7f0;
+  background-image:
+    radial-gradient(ellipse 70% 45% at 50% 0%, rgb(216 199 163 / 0.45), transparent 55%),
+    linear-gradient(180deg, #fcf9f2, #f5f0e6);
+  position: relative;
+  min-height: 100dvh;
+}
+
+.invite-linen::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.22;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px 160px;
+  mix-blend-mode: multiply;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-script {
+  font-family: var(--font-script);
+}
+
+.font-label {
+  font-family: var(--font-label);
+  font-weight: 300;
+}
+
+.font-serif-italic {
+  font-family: var(--font-body);
+  font-style: italic;
+}
+
+.btn-luxury {
+  transition:
+    transform 0.32s var(--ease-editorial),
+    box-shadow 0.32s ease,
+    background-color 0.32s ease,
+    filter 0.32s ease;
+}
+
+.btn-luxury:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.1);
+  box-shadow:
+    0 12px 36px -8px rgb(122 85 40 / 0.48),
+    0 4px 14px -4px rgba(0, 0, 0, 0.14);
+}
+
+.btn-luxury:active {
+  transform: scale(0.99);
+}
+
+@keyframes editorial-fade-up {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 18px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translateZ(0);
+  }
+}
+
+.animate-editorial-rise {
+  animation: editorial-fade-up 0.95s var(--ease-editorial) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-editorial-rise,
+  .btn-luxury {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .btn-luxury:hover {
+    transform: none;
+  }
+}

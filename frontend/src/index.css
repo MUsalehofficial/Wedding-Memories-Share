@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+@import './styles/tokens.css';
+
+@import '@fontsource/italiana/400.css';
+@import '@fontsource/cormorant-garamond/400.css';
+@import '@fontsource/cormorant-garamond/500.css';
+@import '@fontsource/cormorant-garamond/400-italic.css';
+@import '@fontsource/jura/300.css';
+@import '@fontsource/jura/400.css';
+@import '@fontsource/pinyon-script/400.css';
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  border-color: hsl(var(--border));
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-body);
+  font-feature-settings: 'liga', 'dlig';
+  -webkit-font-smoothing: antialiased;
+}

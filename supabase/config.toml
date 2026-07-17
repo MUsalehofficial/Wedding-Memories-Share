@@ -1,0 +1,10 @@
+project_id = "REPLACE_AFTER_CREATE"
+
+[api]
+enabled = true
+
+[db]
+major_version = 17
+
+[functions.wedding-api]
+verify_jwt = false

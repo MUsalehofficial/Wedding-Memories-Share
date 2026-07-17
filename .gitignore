@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+**/.env.local
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Supabase
+supabase/.branches
+supabase/.temp
+
+# Test / coverage
+coverage/
+playwright-report/
+test-results/
+
+# Spike local artifacts
+*.pem
+*.p12
+credentials.json
