@@ -248,8 +248,18 @@ export async function deleteDriveFile(accessToken: string, fileId: string) {
   return { ok: res.ok || res.status === 404, status: res.status }
 }
 
-export async function downloadDriveFile(accessToken: string, fileId: string): Promise<Response> {
-  return await driveFetch(accessToken, `${DRIVE}/files/${fileId}?alt=media`)
+/** Stream Drive media bytes. Forward Range; never buffer the body. */
+export async function downloadDriveFile(
+  accessToken: string,
+  fileId: string,
+  opts: { range?: string | null; signal?: AbortSignal } = {},
+): Promise<Response> {
+  const headers = new Headers()
+  if (opts.range) headers.set('Range', opts.range)
+  return await driveFetch(accessToken, `${DRIVE}/files/${fileId}?alt=media`, {
+    headers,
+    signal: opts.signal,
+  })
 }
 
 /** Query resumable upload progress. Returns next byte offset (0 if empty). */

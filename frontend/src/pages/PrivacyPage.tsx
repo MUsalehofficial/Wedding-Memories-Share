@@ -17,8 +17,9 @@ export function PrivacyPage() {
             Access requires the wedding code shared with invited guests.
           </p>
           <p>
-            The couple may moderate, hide, or remove media. Original files are not offered for
-            guest download from the gallery.
+            The couple may moderate, hide, or remove media. Guests may play approved videos through
+            an authenticated stream and download originals when offered. Drive files stay private —
+            they are never shared as public links.
           </p>
         </div>
         <Link to="/" className="mt-10 inline-block font-label text-[11px] uppercase tracking-[0.3em] text-lux-gold-dark">

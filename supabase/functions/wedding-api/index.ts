@@ -8,6 +8,7 @@ import {
 } from '../_shared/capacity.ts'
 import { DEFAULT_CHUNK_BYTES } from '../_shared/chunks.ts'
 import { mintGuestToken, verifyGuestToken } from '../_shared/guest_token.ts'
+import { mintPlaybackToken, verifyPlaybackToken } from '../_shared/playback_token.ts'
 import { previewObjectPath, validateUploadMeta } from '../_shared/upload_validation.ts'
 import { DEFAULT_SAFETY_RESERVE_BYTES } from '../_shared/upload_limits.ts'
 import { hashAccessCode, timingSafeEqual } from '../_shared/access_code.ts'
@@ -48,6 +49,68 @@ const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp'])
 const MAX_SPIKE_BYTES = 5 * 1024 * 1024
 const PREVIEW_BUCKET = 'wedding-previews'
 const SIGNED_TTL_SEC = 120
+/** Short-lived stream/download URLs for <video src> (no permanent secrets in URL). */
+const PLAYBACK_TTL_SEC = 180
+
+function apiPublicBase(): string {
+  const url = Deno.env.get('SUPABASE_URL')?.replace(/\/$/, '')
+  if (!url) throw new Error('SUPABASE_URL missing')
+  return `${url}/functions/v1/wedding-api`
+}
+
+function parseMediaRoute(
+  route: string,
+): { mediaId: string; action: 'playback' | 'stream' | 'download' } | null {
+  const m = /^media\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(playback|stream|download)$/i
+    .exec(route)
+  if (!m) return null
+  return { mediaId: m[1]!, action: m[2] as 'playback' | 'stream' | 'download' }
+}
+
+/** Dedicated secret — never reuse guest/admin/service-role/Google secrets. */
+function playbackSecret(): string {
+  const s = Deno.env.get('PLAYBACK_TOKEN_SECRET')
+  if (!s) throw new Error('PLAYBACK_TOKEN_SECRET missing')
+  return s
+}
+
+function playbackJson(
+  body: unknown,
+  status: number,
+  origin: string | null,
+  requestId: string,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...corsHeaders(origin),
+      'Content-Type': 'application/json',
+      'Cache-Control': 'private, no-store',
+      'x-request-id': requestId,
+    },
+  })
+}
+
+/** Build stream response headers from Drive; never copy Authorization. */
+function mediaStreamHeaders(
+  origin: string | null,
+  requestId: string,
+  driveRes: Response,
+  contentType: string,
+  disposition?: string,
+): Headers {
+  const headers = new Headers(corsHeaders(origin))
+  headers.set('x-request-id', requestId)
+  headers.set('Accept-Ranges', 'bytes')
+  headers.set('Cache-Control', 'private, no-store')
+  headers.set('Content-Type', driveRes.headers.get('Content-Type') || contentType)
+  const len = driveRes.headers.get('Content-Length')
+  if (len) headers.set('Content-Length', len)
+  const cr = driveRes.headers.get('Content-Range')
+  if (cr) headers.set('Content-Range', cr)
+  if (disposition) headers.set('Content-Disposition', disposition)
+  return headers
+}
 
 function adminClient() {
   const url = Deno.env.get('SUPABASE_URL')
@@ -411,6 +474,7 @@ Deno.serve(async (req) => {
           secrets: {
             ...presence,
             GUEST_TOKEN_SIGNING_SECRET: Boolean(Deno.env.get('GUEST_TOKEN_SIGNING_SECRET')),
+            PLAYBACK_TOKEN_SECRET: Boolean(Deno.env.get('PLAYBACK_TOKEN_SECRET')),
             ADMIN_PANEL_SECRET: adminConfigured,
             // ADMIN_EMAIL is identity-only — never treated as a passphrase; not reported as auth.
           },
@@ -620,9 +684,180 @@ Deno.serve(async (req) => {
           hasPreview: Boolean(previewUrl),
           previewUrl,
           previewExpiresInSec: previewUrl ? SIGNED_TTL_SEC : null,
+          // Videos play via authenticated stream — never use previewUrl as video src.
+          canPlay: row.media_kind === 'video',
         })
       }
       return json({ items, sort, requestId }, 200, origin, requestId)
+    }
+
+    const mediaRoute = parseMediaRoute(route)
+    if (mediaRoute?.action === 'playback' && req.method === 'GET') {
+      const sb = adminClient()
+      const { eventId, galleryEnabled, guestTokenVersion } = await loadEventSettings(sb)
+      const guest = await requireGuest(req, eventId, guestTokenVersion)
+      if (!guest.ok) return guest.response
+      if (!galleryEnabled) {
+        return playbackJson({ error: 'gallery_disabled', requestId }, 403, origin, requestId)
+      }
+      let secret: string
+      try {
+        secret = playbackSecret()
+      } catch {
+        return playbackJson({ error: 'playback_not_configured', requestId }, 503, origin, requestId)
+      }
+      const { data: row, error } = await sb
+        .from('media')
+        .select(
+          'id, event_id, media_kind, mime_type, original_drive_item_id, google_original_file_id, upload_status, moderation_status, status, size_bytes',
+        )
+        .eq('id', mediaRoute.mediaId)
+        .maybeSingle()
+      if (error) throw new Error(error.message || 'media_lookup_failed')
+      const driveFileId =
+        (row?.google_original_file_id as string | null) ||
+        (row?.original_drive_item_id as string | null) ||
+        null
+      if (
+        !row ||
+        row.event_id !== eventId ||
+        row.media_kind !== 'video' ||
+        row.upload_status !== 'uploaded' ||
+        row.moderation_status !== 'approved' ||
+        row.status !== 'approved' ||
+        !driveFileId
+      ) {
+        return playbackJson({ error: 'media_not_playable', requestId }, 404, origin, requestId)
+      }
+      const stream = await mintPlaybackToken(secret, {
+        mediaId: row.id,
+        eventId,
+        purpose: 'stream',
+        ttlSeconds: PLAYBACK_TTL_SEC,
+      })
+      const download = await mintPlaybackToken(secret, {
+        mediaId: row.id,
+        eventId,
+        purpose: 'download',
+        ttlSeconds: PLAYBACK_TTL_SEC,
+      })
+      const base = apiPublicBase()
+      return playbackJson(
+        {
+          mediaId: row.id,
+          mimeType: row.mime_type,
+          sizeBytes: row.size_bytes != null ? Number(row.size_bytes) : null,
+          expiresInSec: PLAYBACK_TTL_SEC,
+          streamUrl: `${base}/media/${row.id}/stream?p=${encodeURIComponent(stream.token)}`,
+          downloadUrl: `${base}/media/${row.id}/download?p=${encodeURIComponent(download.token)}`,
+          // ponytail: Edge wall-clock/idle limits; do not claim reliable 2 GB streaming.
+          playbackNote:
+            'Authenticated Range proxy through Edge Functions. Prefer short wedding clips; large files may time out — use Download Original as fallback.',
+          requestId,
+        },
+        200,
+        origin,
+        requestId,
+      )
+    }
+
+    if (
+      mediaRoute &&
+      (mediaRoute.action === 'stream' || mediaRoute.action === 'download') &&
+      (req.method === 'GET' || req.method === 'HEAD')
+    ) {
+      const purpose = mediaRoute.action === 'download' ? 'download' : 'stream'
+      let secret: string
+      try {
+        secret = playbackSecret()
+      } catch {
+        return playbackJson({ error: 'playback_not_configured', requestId }, 503, origin, requestId)
+      }
+      const playback = await verifyPlaybackToken(secret, url.searchParams.get('p'), {
+        mediaId: mediaRoute.mediaId,
+        purpose,
+      })
+      if (!playback.ok) {
+        return playbackJson({ error: playback.code, requestId }, 401, origin, requestId)
+      }
+      const sb = adminClient()
+      const { eventId, galleryEnabled } = await loadEventSettings(sb)
+      if (!galleryEnabled) {
+        return playbackJson({ error: 'gallery_disabled', requestId }, 403, origin, requestId)
+      }
+      if (playback.claims.eventId !== eventId) {
+        return playbackJson({ error: 'playback_token_mismatch', requestId }, 401, origin, requestId)
+      }
+      const { data: row, error } = await sb
+        .from('media')
+        .select(
+          'id, event_id, media_kind, mime_type, original_drive_item_id, google_original_file_id, upload_status, moderation_status, status, size_bytes',
+        )
+        .eq('id', mediaRoute.mediaId)
+        .maybeSingle()
+      if (error) throw new Error(error.message || 'media_lookup_failed')
+      const driveFileId =
+        (row?.google_original_file_id as string | null) ||
+        (row?.original_drive_item_id as string | null) ||
+        null
+      if (
+        !row ||
+        row.event_id !== eventId ||
+        row.media_kind !== 'video' ||
+        row.upload_status !== 'uploaded' ||
+        row.moderation_status !== 'approved' ||
+        row.status !== 'approved' ||
+        !driveFileId
+      ) {
+        return playbackJson({ error: 'media_not_playable', requestId }, 404, origin, requestId)
+      }
+
+      const contentType = row.mime_type || 'video/quicktime'
+      // ponytail: production media table may omit original_filename_sanitized; default is fine for Content-Disposition.
+      const safeName = contentType.includes('quicktime') || contentType.includes('mp4') ? 'video.mov' : 'video.bin'
+      const access = await accessTokenForEvent(sb, eventId)
+      const driveId = driveFileId
+
+      if (req.method === 'HEAD') {
+        const meta = await getFileMetadata(access, driveId)
+        const headers = new Headers(corsHeaders(origin))
+        headers.set('x-request-id', requestId)
+        headers.set('Accept-Ranges', 'bytes')
+        headers.set('Content-Type', meta.mimeType || contentType)
+        if (meta.size) headers.set('Content-Length', String(meta.size))
+        headers.set('Cache-Control', 'private, no-store')
+        if (purpose === 'download') {
+          headers.set('Content-Disposition', `attachment; filename="${safeName}"`)
+        }
+        return new Response(null, { status: 200, headers })
+      }
+
+      // GET: pipe Drive bytes — never arrayBuffer / blob the full body.
+      const range = req.headers.get('Range')
+      const driveRes = await downloadDriveFile(access, driveId, {
+        range,
+        signal: req.signal,
+      })
+      if (driveRes.status === 416) {
+        return new Response(driveRes.body, {
+          status: 416,
+          headers: mediaStreamHeaders(origin, requestId, driveRes, contentType),
+        })
+      }
+      if (!(driveRes.status === 200 || driveRes.status === 206) || !driveRes.body) {
+        return playbackJson(
+          { error: 'stream_upstream_failed', status: driveRes.status, requestId },
+          502,
+          origin,
+          requestId,
+        )
+      }
+      const disposition =
+        purpose === 'download' ? `attachment; filename="${safeName}"` : undefined
+      return new Response(driveRes.body, {
+        status: driveRes.status,
+        headers: mediaStreamHeaders(origin, requestId, driveRes, contentType, disposition),
+      })
     }
 
     if (route === 'gdrive-status' && req.method === 'GET') {
@@ -1345,7 +1580,7 @@ Deno.serve(async (req) => {
         ? 503
         : message.includes('invalid_grant')
         ? 401
-        : message.includes('GUEST_TOKEN_SIGNING_SECRET')
+        : message.includes('GUEST_TOKEN_SIGNING_SECRET') || message.includes('PLAYBACK_TOKEN_SECRET')
         ? 503
         : 500
     if (message.includes('invalid_grant')) {
