@@ -238,11 +238,16 @@ assert.match(fe, /VIDEO_HEADER_BYTES/)
 
 const upload = readFileSync(join(dir, '../../../frontend/src/pages/UploadPage.tsx'), 'utf8')
 assert.match(upload, /\.mov/)
-assert.match(upload, /Video saved, but its preview could not be generated/)
+assert.match(upload, /SAFARI_POSTER_FAIL_MESSAGE/)
 assert.match(upload, /headerBase64/)
 assert.match(upload, /Preparing from Photos or iCloud/)
 assert.match(upload, /status: 'selected'/)
 assert.match(upload, /retryModeFor/)
 assert.match(upload, /isIphoneSafari/)
+
+const previewSrc = readFileSync(join(dir, '../../../frontend/src/lib/preview.ts'), 'utf8')
+assert.match(previewSrc, /The video was saved, but Safari could not generate a preview/)
+assert.match(previewSrc, /loadedmetadata/)
+assert.match(previewSrc, /seeked/)
 
 console.log('upload_validation_mov.node-test: ok')

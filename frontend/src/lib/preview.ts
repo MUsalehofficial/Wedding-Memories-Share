@@ -5,6 +5,9 @@ const JPEG_QUALITY = 0.72
 /** If canvas encoding fails, originals under this size may be sent as the preview. */
 const RAW_PREVIEW_MAX_BYTES = 1_500_000
 
+const POSTER_METADATA_TIMEOUT_MS = 15_000
+const POSTER_SEEK_TIMEOUT_MS = 15_000
+
 function canvasToJpegBlob(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
   return new Promise((resolve, reject) => {
     // Prefer toBlob; fall back to dataURL→Blob when Safari returns null.
@@ -105,37 +108,187 @@ export async function makeImagePreview(file: File): Promise<{ blob: Blob; conten
   throw new Error('preview_generation_failed')
 }
 
-export async function makeVideoPoster(file: File): Promise<{ blob: Blob; contentType: string } | null> {
+export type VideoPosterOk = { ok: true; blob: Blob; contentType: string }
+export type VideoPosterFail = {
+  ok: false
+  stage: string
+  code: string
+  message: string
+  mediaError?: { code: number; message: string } | null
+  domException?: { name: string; message: string } | null
+}
+
+export const SAFARI_POSTER_FAIL_MESSAGE =
+  'The video was saved, but Safari could not generate a preview.'
+
+function logPoster(stage: string, detail: Record<string, unknown> = {}) {
+  console.info('[wedding-upload]', 'poster', stage, detail)
+}
+
+/** Safe seek target for poster frames. */
+export function posterSeekSeconds(duration: number): number {
+  if (!Number.isFinite(duration) || duration <= 0) return 0
+  return Math.min(0.5, Math.max(0, duration / 10))
+}
+
+function mediaErrorInfo(video: HTMLVideoElement): { code: number; message: string } | null {
+  const e = video.error
+  if (!e) return null
+  return { code: e.code, message: e.message || `MediaError code ${e.code}` }
+}
+
+function domExceptionInfo(err: unknown): { name: string; message: string } | null {
+  if (err instanceof DOMException) return { name: err.name, message: err.message }
+  if (err instanceof Error) return { name: err.name, message: err.message }
+  return null
+}
+
+function waitVideoEvent(
+  video: HTMLVideoElement,
+  event: keyof HTMLMediaElementEventMap,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup()
+      reject(new Error(`${event}_timeout`))
+    }, timeoutMs)
+    const onOk = () => {
+      cleanup()
+      resolve()
+    }
+    const onErr = () => {
+      cleanup()
+      const me = mediaErrorInfo(video)
+      reject(new Error(me?.message || `${event}_error`))
+    }
+    const cleanup = () => {
+      window.clearTimeout(timer)
+      video.removeEventListener(event, onOk)
+      video.removeEventListener('error', onErr)
+    }
+    video.addEventListener(event, onOk, { once: true })
+    video.addEventListener('error', onErr, { once: true })
+  })
+}
+
+/**
+ * Generate a JPEG poster from a local video File.
+ * Fresh video element + object URL per attempt; revoke only in finally after draw/toBlob.
+ */
+export async function makeVideoPoster(file: File): Promise<VideoPosterOk | VideoPosterFail> {
   const url = URL.createObjectURL(file)
   const video = document.createElement('video')
+  logPoster('video_element_created', {
+    name: file.name,
+    size: file.size,
+    type: file.type || '(empty)',
+  })
+
+  const fail = (stage: string, code: string, err?: unknown): VideoPosterFail => {
+    const result: VideoPosterFail = {
+      ok: false,
+      stage,
+      code,
+      message: SAFARI_POSTER_FAIL_MESSAGE,
+      mediaError: mediaErrorInfo(video),
+      domException: domExceptionInfo(err),
+    }
+    logPoster('failed', {
+      stage,
+      code,
+      mediaError: result.mediaError,
+      domException: result.domException,
+      err: err instanceof Error ? err.message : String(err ?? ''),
+    })
+    return result
+  }
+
   try {
+    video.preload = 'metadata'
     video.muted = true
     video.playsInline = true
-    video.preload = 'metadata'
+    video.setAttribute('playsinline', 'true')
+    video.setAttribute('webkit-playsinline', 'true')
     video.src = url
-    await new Promise<void>((resolve, reject) => {
-      video.onloadeddata = () => resolve()
-      video.onerror = () => reject(new Error('video_load_failed'))
-    })
-    video.currentTime = Math.min(0.1, (video.duration || 1) / 10)
-    await new Promise<void>((resolve) => {
-      video.onseeked = () => resolve()
-    })
-    const canvas = drawToCanvas(video, video.videoWidth || 640, video.videoHeight || 360)
+
+    try {
+      await waitVideoEvent(video, 'loadedmetadata', POSTER_METADATA_TIMEOUT_MS)
+      logPoster('loadedmetadata', {
+        duration: video.duration,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        readyState: video.readyState,
+      })
+    } catch (err) {
+      return fail('loadedmetadata', 'metadata_failed', err)
+    }
+
+    // Best-effort decode readiness — do not fail the poster if only metadata is available.
+    try {
+      await Promise.race([
+        waitVideoEvent(video, 'loadeddata', POSTER_METADATA_TIMEOUT_MS),
+        waitVideoEvent(video, 'canplay', POSTER_METADATA_TIMEOUT_MS),
+      ])
+      logPoster('loadeddata_or_canplay', {
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+        readyState: video.readyState,
+      })
+    } catch (err) {
+      logPoster('loadeddata_or_canplay_soft_fail', {
+        message: err instanceof Error ? err.message : String(err),
+        readyState: video.readyState,
+      })
+    }
+
+    const seekTo = posterSeekSeconds(video.duration)
+    logPoster('seeking', { seekTo, duration: video.duration })
+    try {
+      const seeked = waitVideoEvent(video, 'seeked', POSTER_SEEK_TIMEOUT_MS)
+      video.currentTime = seekTo
+      await seeked
+      logPoster('seeked', {
+        currentTime: video.currentTime,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+      })
+    } catch (err) {
+      return fail('seeked', 'seek_failed', err)
+    }
+
+    const w = video.videoWidth
+    const h = video.videoHeight
+    if (!w || !h) {
+      return fail('dimensions', 'zero_frame', new Error(`zero_dimensions ${w}x${h}`))
+    }
+
+    let canvas: HTMLCanvasElement
+    try {
+      canvas = drawToCanvas(video, w, h)
+      logPoster('canvas_drawImage', { canvasWidth: canvas.width, canvasHeight: canvas.height })
+    } catch (err) {
+      return fail('canvas_drawImage', 'draw_failed', err)
+    }
+
     try {
       const blob = await canvasToJpegBlob(canvas, 0.75)
+      logPoster('canvas_toBlob', { bytes: blob.size, type: blob.type })
       canvas.width = 0
       canvas.height = 0
-      return { blob, contentType: 'image/jpeg' }
-    } catch {
-      return null
+      return { ok: true, blob, contentType: 'image/jpeg' }
+    } catch (err) {
+      return fail('canvas_toBlob', 'encode_failed', err)
     }
-  } catch {
-    return null
   } finally {
-    video.removeAttribute('src')
-    video.load()
+    try {
+      video.removeAttribute('src')
+      video.load()
+    } catch {
+      /* ignore */
+    }
     URL.revokeObjectURL(url)
+    logPoster('cleanup', { revoked: true })
   }
 }
 
