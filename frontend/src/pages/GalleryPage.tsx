@@ -178,7 +178,7 @@ export function GalleryPage() {
               <div className="mx-auto flex aspect-video max-h-[40dvh] w-full max-w-md flex-col items-center justify-center gap-3 rounded-[10px] bg-white/70">
                 <Play className="h-8 w-8 text-lux-gold-dark" aria-hidden />
                 <p className="font-label text-[10px] uppercase tracking-[0.28em] text-lux-gold-dark">
-                  Video preview unavailable
+                  Preview not available
                 </p>
               </div>
             ) : null}

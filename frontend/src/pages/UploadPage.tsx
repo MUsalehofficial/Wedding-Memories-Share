@@ -8,7 +8,7 @@ import {
   mediaKindOf,
   userMessageForUploadError,
 } from '../lib/mediaValidate'
-import { blobToBase64, makeImagePreview, makeVideoPoster } from '../lib/preview'
+import { blobToBase64, makeImagePreview, makeVideoPoster, SAFARI_POSTER_FAIL_MESSAGE } from '../lib/preview'
 import { putResumableFile, queryResumableOffset } from '../lib/resumableUpload'
 import { getGuestToken } from '../lib/session'
 
@@ -222,8 +222,22 @@ async function uploadPreviewFor(
   job: FileJob,
   onUpdate: (patch: Partial<FileJob>) => void,
 ): Promise<void> {
-  if (!job.file) throw new Error('Re-select this file to retry the preview.')
   if (!job.mediaId) throw new Error('missing_media_id')
+
+  // Recovery: without a local File we cannot regenerate a poster from Drive.
+  if (!job.file) {
+    onUpdate({
+      status: 'completed',
+      progress: 100,
+      hasPreview: false,
+      posterStatus: 'failed',
+      error:
+        'The original video is saved, but this device no longer has the local file needed to regenerate a preview.',
+    })
+    logApi('poster_local_file_missing', { mediaId: job.mediaId })
+    return
+  }
+
   const mediaKind = mediaKindOf(job.file)
   onUpdate({ status: 'preparing_preview', error: undefined })
   if (mediaKind === 'image') {
@@ -235,6 +249,7 @@ async function uploadPreviewFor(
     }
     onUpdate({ status: 'preparing_preview' })
     const base64 = await blobToBase64(preview.blob)
+    logApi('preview_upload_start', { mediaId: job.mediaId, kind: 'image', bytes: preview.blob.size })
     await apiJson('gdrive-upload-preview', {
       method: 'POST',
       guestToken: token,
@@ -246,25 +261,35 @@ async function uploadPreviewFor(
         kind: 'image',
       }),
     })
+    logApi('preview_upload_ok', { mediaId: job.mediaId, kind: 'image' })
     onUpdate({ status: 'completed', progress: 100, hasPreview: true, error: undefined })
     return
   }
 
   // Video: poster is best-effort — original success must not depend on it.
+  // Keep job.file alive; do not revoke anything owned by the File itself.
   onUpdate({ status: 'preparing_preview' })
   const poster = await makeVideoPoster(job.file)
-  if (!poster) {
+  if (!poster.ok) {
+    logApi('poster_generation_failed', {
+      mediaId: job.mediaId,
+      stage: poster.stage,
+      code: poster.code,
+      mediaError: poster.mediaError ?? null,
+      domException: poster.domException ?? null,
+    })
     onUpdate({
       status: 'completed',
       progress: 100,
       hasPreview: false,
       posterStatus: 'failed',
-      error: 'Video saved, but its preview could not be generated.',
+      error: SAFARI_POSTER_FAIL_MESSAGE,
     })
     return
   }
   try {
     const base64 = await blobToBase64(poster.blob)
+    logApi('preview_upload_start', { mediaId: job.mediaId, kind: 'poster', bytes: poster.blob.size })
     await apiJson('gdrive-upload-preview', {
       method: 'POST',
       guestToken: token,
@@ -276,6 +301,7 @@ async function uploadPreviewFor(
         kind: 'poster',
       }),
     })
+    logApi('preview_upload_ok', { mediaId: job.mediaId, kind: 'poster' })
     onUpdate({
       status: 'completed',
       progress: 100,
@@ -283,13 +309,19 @@ async function uploadPreviewFor(
       posterStatus: 'ok',
       error: undefined,
     })
-  } catch {
+  } catch (err) {
+    logApi('preview_upload_failed', {
+      mediaId: job.mediaId,
+      kind: 'poster',
+      code: err instanceof ApiError ? err.code : 'upload_failed',
+      requestId: err instanceof ApiError ? err.requestId : null,
+    })
     onUpdate({
       status: 'completed',
       progress: 100,
       hasPreview: false,
       posterStatus: 'failed',
-      error: 'Video saved, but its preview could not be generated.',
+      error: SAFARI_POSTER_FAIL_MESSAGE,
     })
   }
 }
@@ -304,6 +336,14 @@ async function uploadOne(
   mode: 'full' | 'preview' | 'complete' = 'full',
 ): Promise<void> {
   if (mode === 'preview') {
+    // Preview-only: never create a Drive resumable session / never re-upload original.
+    if (!job.mediaId) {
+      onUpdate({
+        status: 'preview_failed',
+        error: 'Preview generation failed — missing media id.',
+      })
+      return
+    }
     try {
       await uploadPreviewFor(token, job, onUpdate)
     } catch (err) {
@@ -312,8 +352,11 @@ async function uploadOne(
         requestId: err instanceof ApiError ? err.requestId : null,
       })
       onUpdate({
-        status: 'preview_failed',
-        error: 'Preview generation failed',
+        status: job.originalVerified ? 'completed' : 'preview_failed',
+        originalVerified: job.originalVerified,
+        posterStatus: 'failed',
+        hasPreview: false,
+        error: job.file ? SAFARI_POSTER_FAIL_MESSAGE : 'Preview generation failed',
       })
     }
     return
@@ -718,9 +761,86 @@ export function UploadPage() {
 
   const jobsRef = useRef(jobs)
   jobsRef.current = jobs
+  const previewRetryInputRef = useRef<HTMLInputElement | null>(null)
+  const previewRetryJobIdRef = useRef<string | null>(null)
 
   function patchJob(id: string, patch: Partial<FileJob>) {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...patch } : j)))
+  }
+
+  function beginPreviewRetryPick(jobId: string) {
+    const job = jobsRef.current.find((j) => j.id === jobId)
+    if (!job?.mediaId) return
+    // Already have local File — regenerate preview only (never create-session).
+    if (job.file) {
+      void retryPreviewOnly(jobId)
+      return
+    }
+    previewRetryJobIdRef.current = jobId
+    const input = previewRetryInputRef.current
+    if (input) {
+      input.value = ''
+      input.click()
+    }
+  }
+
+  async function retryPreviewOnly(jobId: string, fileOverride?: File) {
+    if (!token || !info) return
+    const job = jobsRef.current.find((j) => j.id === jobId)
+    if (!job?.mediaId) return
+    const effective: FileJob = fileOverride ? { ...job, file: fileOverride } : job
+    if (!effective.file) {
+      beginPreviewRetryPick(jobId)
+      return
+    }
+    setBusy(true)
+    patchJob(jobId, {
+      file: effective.file,
+      error: 'Regenerating preview only for the existing video. The original will not be uploaded again.',
+      status: job.status === 'completed' || job.originalVerified ? 'completed' : job.status,
+      posterStatus: job.posterStatus ?? 'failed',
+    })
+    try {
+      // Hard-force preview mode — never full/complete / never create-session.
+      await uploadOne(token, info, effective, name, message, (patch) => patchJob(jobId, patch), 'preview')
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? userMessageForUploadError(err.code, err.message)
+          : err instanceof Error
+            ? err.message
+            : String(err)
+      patchJob(jobId, {
+        status: 'completed',
+        originalVerified: true,
+        posterStatus: 'failed',
+        hasPreview: false,
+        error: /load failed/i.test(msg) ? SAFARI_POSTER_FAIL_MESSAGE : msg,
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function onPreviewRetryFile(files: FileList | null) {
+    const jobId = previewRetryJobIdRef.current
+    previewRetryJobIdRef.current = null
+    if (!jobId || !files?.length) return
+    const file = files[0]
+    if (!file) return
+    const job = jobsRef.current.find((j) => j.id === jobId)
+    if (!job?.mediaId) return
+
+    // Attach only to this existing media item — never seed a new upload job.
+    patchJob(jobId, {
+      file,
+      fileName: file.name,
+      fileSize: file.size,
+      fileType: file.type || job.fileType,
+      mediaKind: 'video',
+      error: 'Regenerating preview only for the existing video. The original will not be uploaded again.',
+    })
+    void retryPreviewOnly(jobId, file)
   }
 
   function onPick(files: FileList | null) {
@@ -745,22 +865,28 @@ export function UploadPage() {
           (j.status === 'preview_failed' || j.status === 'failed' || j.posterStatus === 'failed'),
       )
       if (orphanMatch) {
+        const previewOnly =
+          orphanMatch.posterStatus === 'failed' ||
+          orphanMatch.status === 'preview_failed' ||
+          (orphanMatch.originalVerified && !orphanMatch.hasPreview)
         setJobs((prev) =>
           prev.map((j) =>
             j.id === orphanMatch.id
               ? {
                   ...j,
                   file,
-                  error:
-                    j.posterStatus === 'failed'
-                      ? 'Video saved, but its preview could not be generated.'
-                      : j.status === 'preview_failed'
-                        ? 'Preview generation failed'
-                        : j.error,
+                  error: previewOnly
+                    ? 'Regenerating preview only for the existing video. The original will not be uploaded again.'
+                    : j.status === 'failed'
+                      ? j.error
+                      : j.error,
                 }
               : j,
           ),
         )
+        if (previewOnly && orphanMatch.mediaId) {
+          void retryPreviewOnly(orphanMatch.id, file)
+        }
         continue
       }
       seeded.push({
@@ -1016,6 +1142,16 @@ export function UploadPage() {
               onChange={(e) => onPick(e.target.files)}
               className="mt-2 block w-full text-sm text-mist file:mr-4 file:rounded-[11px] file:border-0 file:bg-lux-gold-dark file:px-4 file:py-2 file:font-label file:text-[10px] file:uppercase file:tracking-[0.28em] file:text-white"
             />
+            {/* Dedicated picker for Retry Preview — never seeds a new upload job. */}
+            <input
+              ref={previewRetryInputRef}
+              type="file"
+              accept="video/mp4,video/quicktime,.mp4,.mov"
+              className="sr-only"
+              aria-hidden
+              tabIndex={-1}
+              onChange={(e) => onPreviewRetryFile(e.target.files)}
+            />
             <p className="mt-2 font-body text-xs text-mist">
               Photos and videos stored in iCloud may take a moment to prepare. Keep this page open.
             </p>
@@ -1051,15 +1187,19 @@ export function UploadPage() {
                 (job.status === 'preview_failed' ||
                   job.status === 'failed' ||
                   job.posterStatus === 'failed') ? (
-                  <p className="mt-2 text-xs text-mist">Re-select the same file to retry.</p>
+                  <p className="mt-2 text-xs text-mist">
+                    {job.posterStatus === 'failed' || job.status === 'preview_failed'
+                      ? 'Use Retry preview and re-select the same video. Preview only — the original will not be uploaded again.'
+                      : 'Re-select the same file to retry.'}
+                  </p>
                 ) : null}
                 {job.status === 'preview_failed' ||
                 (job.status === 'completed' && job.posterStatus === 'failed') ? (
                   <button
                     type="button"
                     className="mt-2 font-label text-[10px] uppercase tracking-[0.24em] text-lux-gold-dark underline-offset-2 hover:underline"
-                    onClick={() => void retryOne(job.id)}
-                    disabled={busy || !job.file}
+                    onClick={() => beginPreviewRetryPick(job.id)}
+                    disabled={busy}
                   >
                     Retry preview
                   </button>
