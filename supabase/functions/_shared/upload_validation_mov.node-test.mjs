@@ -75,7 +75,9 @@ function validateVideo(input) {
   if (!allowed) return { ok: false, code: 'disallowed_extension' }
   const mime = (input.mimeType || '').toLowerCase().trim()
   if (!allowed.has(mime)) return { ok: false, code: 'unsupported_mime' }
-  if (input.byteSize > input.maxVideoBytes) return { ok: false, code: 'exceeds_configured_max' }
+  if (input.byteSize > input.maxVideoBytes) {
+    return { ok: false, code: 'exceeds_configured_max', message: 'Videos must be 2 GB or smaller.' }
+  }
   if (
     input.maxVideoDurationSeconds > 0 &&
     input.durationSeconds != null &&
@@ -165,18 +167,43 @@ assert.equal(
   'invalid_video_container',
 )
 
-// Oversized
 assert.equal(
   validateVideo({
     filename: 'big.mov',
     mimeType: 'video/quicktime',
-    byteSize: 200_000_000,
-    maxVideoBytes: 100_000_000,
+    byteSize: 2_000_000_001,
+    maxVideoBytes: 2_000_000_000,
     maxVideoDurationSeconds: 60,
     durationSeconds: 10,
     headerBytes: qt,
   }).code,
   'exceeds_configured_max',
+)
+
+// Exactly 2 GB ok; just under ok
+assert.equal(
+  validateVideo({
+    filename: 'edge.mov',
+    mimeType: 'video/quicktime',
+    byteSize: 2_000_000_000,
+    maxVideoBytes: 2_000_000_000,
+    maxVideoDurationSeconds: 60,
+    durationSeconds: 10,
+    headerBytes: qt,
+  }).ok,
+  true,
+)
+assert.equal(
+  validateVideo({
+    filename: 'edge.mp4',
+    mimeType: 'video/mp4',
+    byteSize: 1_999_999_999,
+    maxVideoBytes: 2_000_000_000,
+    maxVideoDurationSeconds: 60,
+    durationSeconds: 10,
+    headerBytes: mp4,
+  }).ok,
+  true,
 )
 
 // Too long
@@ -185,7 +212,7 @@ assert.equal(
     filename: 'long.mov',
     mimeType: 'video/quicktime',
     byteSize: 1_000_000,
-    maxVideoBytes: 100_000_000,
+    maxVideoBytes: 2_000_000_000,
     maxVideoDurationSeconds: 60,
     durationSeconds: 120,
     headerBytes: qt,
@@ -196,16 +223,26 @@ assert.equal(
 const src = readFileSync(join(dir, 'upload_validation.ts'), 'utf8')
 assert.match(src, /video\/quicktime/)
 assert.match(src, /invalid_video_container/)
-assert.match(src, /This video is too large/)
+assert.match(src, /VIDEO_TOO_LARGE_MESSAGE/)
 assert.match(src, /This video is too long/)
+assert.match(src, /MAX_VIDEO_BYTES/)
+
+const limits = readFileSync(join(dir, 'upload_limits.ts'), 'utf8')
+assert.match(limits, /MAX_VIDEO_BYTES = 2_000_000_000/)
 
 const fe = readFileSync(join(dir, '../../../frontend/src/lib/mediaValidate.ts'), 'utf8')
 assert.match(fe, /ext === 'mov'/)
 assert.match(fe, /video\/quicktime/)
+assert.match(fe, /MAX_VIDEO_BYTES/)
+assert.match(fe, /VIDEO_HEADER_BYTES/)
 
 const upload = readFileSync(join(dir, '../../../frontend/src/pages/UploadPage.tsx'), 'utf8')
 assert.match(upload, /\.mov/)
 assert.match(upload, /Video saved, but its preview could not be generated/)
 assert.match(upload, /headerBase64/)
+assert.match(upload, /Preparing from Photos or iCloud/)
+assert.match(upload, /status: 'selected'/)
+assert.match(upload, /retryModeFor/)
+assert.match(upload, /isIphoneSafari/)
 
 console.log('upload_validation_mov.node-test: ok')

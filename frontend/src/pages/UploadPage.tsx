@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ApiError, apiJson, logApi } from '../lib/api'
 import {
+  MAX_VIDEO_BYTES,
   gateSelectedFile,
+  isIphoneSafari,
   mediaKindOf,
   userMessageForUploadError,
 } from '../lib/mediaValidate'
@@ -20,17 +22,18 @@ type EventPublic = {
   reconnectRequired: boolean
 }
 
-/** Client pipeline stages (requirement matrix). */
+/** Per-item client pipeline stages. */
 export type UploadStage =
-  | 'queued'
-  | 'uploading_original'
+  | 'selected'
+  | 'preparing'
+  | 'ready'
+  | 'uploading'
   | 'original_uploaded'
-  | 'generating_preview'
-  | 'uploading_preview'
+  | 'preparing_preview'
   | 'completing'
   | 'completed'
   | 'preview_failed'
-  | 'original_failed'
+  | 'failed'
 
 type FileJob = {
   id: string
@@ -38,6 +41,7 @@ type FileJob = {
   fileName: string
   fileSize: number
   fileType: string
+  mediaKind?: 'image' | 'video'
   /** Resolved MIME sent to the API (may differ from File.type for MOV). */
   uploadMimeType?: string
   durationSeconds?: number | null
@@ -59,7 +63,7 @@ type PersistedJob = {
   fileName: string
   fileSize: number
   fileType: string
-  status: UploadStage
+  status: string
   sessionId?: string
   mediaId?: string
   originalVerified?: boolean
@@ -110,24 +114,55 @@ function loadPersistedJobs(): PersistedJob[] {
 
 function stageLabel(status: UploadStage): string {
   switch (status) {
-    case 'uploading_original':
-      return 'Uploading original'
+    case 'selected':
+      return 'Selected'
+    case 'preparing':
+      return 'Preparing'
+    case 'ready':
+      return 'Ready'
+    case 'uploading':
+      return 'Uploading'
     case 'original_uploaded':
       return 'Original saved'
-    case 'generating_preview':
-      return 'Generating preview'
-    case 'uploading_preview':
-      return 'Uploading preview'
+    case 'preparing_preview':
+      return 'Preparing preview'
     case 'completing':
       return 'Finishing'
     case 'completed':
       return 'Completed'
     case 'preview_failed':
       return 'Preview failed'
-    case 'original_failed':
-      return 'Upload failed'
+    case 'failed':
+      return 'Failed'
     default:
       return status
+  }
+}
+
+function normalizeRestoredStatus(raw: string): UploadStage {
+  switch (raw) {
+    case 'queued':
+      return 'ready'
+    case 'uploading':
+      return 'uploading'
+    case 'preparing_preview':
+    case 'uploading_preview':
+      return 'preparing_preview'
+    case 'failed':
+      return 'failed'
+    case 'selected':
+    case 'preparing':
+    case 'ready':
+    case 'uploading':
+    case 'original_uploaded':
+    case 'preparing_preview':
+    case 'completing':
+    case 'completed':
+    case 'preview_failed':
+    case 'failed':
+      return raw
+    default:
+      return 'failed'
   }
 }
 
@@ -172,11 +207,14 @@ async function completeOriginal(
 
 function formatStageError(stage: string, err: unknown): string {
   if (err instanceof ApiError) {
-    const rid = err.requestId ? ` (request ${err.requestId.slice(0, 8)})` : ''
-    return `${stage}: ${err.code}${rid}`
+    return userMessageForUploadError(err.code, err.message)
   }
   const msg = err instanceof Error ? err.message : String(err)
-  return `${stage}: ${msg}`
+  if (/load failed/i.test(msg)) return 'Original upload interrupted'
+  if (stage === 'preview' || stage.includes('preview')) return 'Preview generation failed'
+  if (stage.includes('complete')) return 'Completion verification failed'
+  if (stage.includes('upload')) return 'Original upload interrupted'
+  return msg
 }
 
 async function uploadPreviewFor(
@@ -187,15 +225,15 @@ async function uploadPreviewFor(
   if (!job.file) throw new Error('Re-select this file to retry the preview.')
   if (!job.mediaId) throw new Error('missing_media_id')
   const mediaKind = mediaKindOf(job.file)
-  onUpdate({ status: 'generating_preview', error: undefined })
+  onUpdate({ status: 'preparing_preview', error: undefined })
   if (mediaKind === 'image') {
     let preview: { blob: Blob; contentType: string }
     try {
       preview = await makeImagePreview(job.file)
-    } catch (err) {
-      throw new Error(formatStageError('generating_preview', err))
+    } catch {
+      throw new Error('Preview generation failed')
     }
-    onUpdate({ status: 'uploading_preview' })
+    onUpdate({ status: 'preparing_preview' })
     const base64 = await blobToBase64(preview.blob)
     await apiJson('gdrive-upload-preview', {
       method: 'POST',
@@ -213,6 +251,7 @@ async function uploadPreviewFor(
   }
 
   // Video: poster is best-effort — original success must not depend on it.
+  onUpdate({ status: 'preparing_preview' })
   const poster = await makeVideoPoster(job.file)
   if (!poster) {
     onUpdate({
@@ -224,7 +263,6 @@ async function uploadPreviewFor(
     })
     return
   }
-  onUpdate({ status: 'uploading_preview' })
   try {
     const base64 = await blobToBase64(poster.blob)
     await apiJson('gdrive-upload-preview', {
@@ -275,7 +313,7 @@ async function uploadOne(
       })
       onUpdate({
         status: 'preview_failed',
-        error: 'Original saved; preview failed. ' + formatStageError('preview', err),
+        error: 'Preview generation failed',
       })
     }
     return
@@ -293,8 +331,11 @@ async function uploadOne(
         return uploadOne(token, info, { ...job, uploadUrl: job.uploadUrl ?? null }, name, message, onUpdate, 'full')
       }
       onUpdate({
-        status: 'original_failed',
-        error: formatStageError('complete_upload', err),
+        status: 'failed',
+        error:
+          err instanceof ApiError
+            ? userMessageForUploadError(err.code, 'Completion verification failed')
+            : 'Completion verification failed',
         sessionId: job.sessionId,
         mediaId: job.mediaId,
       })
@@ -311,7 +352,7 @@ async function uploadOne(
     } catch (err) {
       onUpdate({
         status: 'preview_failed',
-        error: 'Original saved; preview failed. ' + formatStageError('preview', err),
+        error: 'Preview generation failed',
         originalVerified: true,
         progress: 100,
       })
@@ -388,7 +429,7 @@ async function uploadOne(
     return
   }
 
-  onUpdate({ status: 'uploading_original', progress: 0, error: undefined })
+  onUpdate({ status: 'uploading', progress: 0, error: undefined })
 
   if (!sessionId || !uploadUrl) {
     const session = await apiJson<{
@@ -468,7 +509,7 @@ async function uploadOne(
       return
     } catch (err) {
       onUpdate({
-        status: 'original_failed',
+        status: 'failed',
         error: formatStageError('complete_upload', err),
         sessionId,
         mediaId,
@@ -511,7 +552,7 @@ async function uploadOne(
       return
     } catch (err) {
       onUpdate({
-        status: 'original_failed',
+        status: 'failed',
         error: formatStageError('complete_upload', err),
         sessionId,
         mediaId,
@@ -531,8 +572,8 @@ async function uploadOne(
     onUpdate({ fileId, status: 'completing', progress: 100, sessionId, mediaId })
   } catch (err) {
     onUpdate({
-      status: 'original_failed',
-      error: formatStageError('uploading_original', err),
+      status: 'failed',
+      error: formatStageError('uploading', err),
       sessionId,
       mediaId,
     })
@@ -552,7 +593,7 @@ async function uploadOne(
   } catch (err) {
     // Original may exist on Drive; keep session/media ids for idempotent complete-only retry
     onUpdate({
-      status: 'original_failed',
+      status: 'failed',
       error: formatStageError('complete_upload', err),
       sessionId,
       mediaId,
@@ -576,7 +617,7 @@ async function uploadOne(
   } catch (err) {
     onUpdate({
       status: 'preview_failed',
-      error: 'Original saved; preview failed. ' + formatStageError('preview', err),
+      error: 'Preview generation failed',
       sessionId,
       mediaId,
       originalVerified: true,
@@ -634,8 +675,8 @@ export function UploadPage() {
             else if (st.originalVerified) {
               status = 'preview_failed'
               errorMsg = 'Original saved; preview failed'
-            } else if (status === 'uploading_original' || status === 'completing') {
-              status = 'original_failed'
+            } else if (status === 'uploading' || status === 'completing') {
+              status = 'failed'
               errorMsg = errorMsg || 'Upload interrupted — retry to finish without duplicating.'
             }
             logApi('reconcile_job', {
@@ -655,7 +696,7 @@ export function UploadPage() {
           fileSize: row.fileSize,
           fileType: row.fileType,
           progress: status === 'completed' || originalVerified ? 100 : 0,
-          status,
+          status: normalizeRestoredStatus(String(status)),
           sessionId,
           mediaId,
           originalVerified,
@@ -675,6 +716,9 @@ export function UploadPage() {
     if (jobs.length) persistJobs(jobs)
   }, [jobs])
 
+  const jobsRef = useRef(jobs)
+  jobsRef.current = jobs
+
   function patchJob(id: string, patch: Partial<FileJob>) {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...patch } : j)))
   }
@@ -682,91 +726,138 @@ export function UploadPage() {
   function onPick(files: FileList | null) {
     if (!files?.length) return
     const list = Array.from(files)
-    void (async () => {
-      const limits = {
-        uploadsEnabled: info?.uploadsEnabled !== false,
-        videoUploadsEnabled: info?.videoUploadsEnabled !== false,
-        maxImageBytes: info?.maxImageBytes ?? 20 * 1024 * 1024,
-        maxVideoBytes: info?.maxVideoBytes ?? 100 * 1024 * 1024,
-        maxVideoDurationSeconds: info?.maxVideoDurationSeconds ?? 60,
-        uploadsPausedReason: info?.uploadsPausedReason ?? null,
-      }
-      const additions: FileJob[] = []
-      for (const file of list) {
-        const orphanMatch = jobs.find(
-          (j) =>
-            !j.file &&
-            j.fileName === file.name &&
-            j.fileSize === file.size &&
-            (j.status === 'preview_failed' || j.status === 'original_failed' || j.posterStatus === 'failed'),
-        )
-        if (orphanMatch) {
-          setJobs((prev) =>
-            prev.map((j) =>
-              j.id === orphanMatch.id
-                ? {
-                    ...j,
-                    file,
-                    error:
-                      j.posterStatus === 'failed'
-                        ? 'Video saved, but its preview could not be generated.'
-                        : j.status === 'preview_failed'
-                          ? 'Original saved; preview failed'
-                          : j.error,
-                  }
-                : j,
-            ),
-          )
-          continue
-        }
+    const limits = {
+      uploadsEnabled: info?.uploadsEnabled !== false,
+      videoUploadsEnabled: info?.videoUploadsEnabled !== false,
+      maxImageBytes: info?.maxImageBytes ?? 20 * 1024 * 1024,
+      maxVideoBytes: info?.maxVideoBytes ?? MAX_VIDEO_BYTES,
+      maxVideoDurationSeconds: info?.maxVideoDurationSeconds ?? 60,
+      uploadsPausedReason: info?.uploadsPausedReason ?? null,
+    }
 
-        const gate = await gateSelectedFile(file, limits)
-        if (!gate.ok) {
-          additions.push({
-            id: crypto.randomUUID(),
-            file,
-            fileName: file.name,
-            fileSize: file.size,
-            fileType: file.type || gate.code,
-            progress: 0,
-            status: 'original_failed',
-            error: gate.message,
-          })
-          continue
-        }
-        additions.push({
-          id: crypto.randomUUID(),
-          file,
-          fileName: file.name,
-          fileSize: file.size,
-          fileType: gate.mimeType,
-          uploadMimeType: gate.mimeType,
-          durationSeconds: gate.durationSeconds,
-          headerBase64: gate.headerBase64,
-          progress: 0,
-          status: 'queued',
-        })
+    const seeded: FileJob[] = []
+    for (const file of list) {
+      const orphanMatch = jobsRef.current.find(
+        (j) =>
+          !j.file &&
+          j.fileName === file.name &&
+          j.fileSize === file.size &&
+          (j.status === 'preview_failed' || j.status === 'failed' || j.posterStatus === 'failed'),
+      )
+      if (orphanMatch) {
+        setJobs((prev) =>
+          prev.map((j) =>
+            j.id === orphanMatch.id
+              ? {
+                  ...j,
+                  file,
+                  error:
+                    j.posterStatus === 'failed'
+                      ? 'Video saved, but its preview could not be generated.'
+                      : j.status === 'preview_failed'
+                        ? 'Preview generation failed'
+                        : j.error,
+                }
+              : j,
+          ),
+        )
+        continue
       }
-      if (additions.length) setJobs((prev) => [...prev, ...additions])
+      seeded.push({
+        id: crypto.randomUUID(),
+        file,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type || 'application/octet-stream',
+        mediaKind: mediaKindOf(file),
+        progress: 0,
+        status: 'selected',
+      })
+    }
+    if (seeded.length) setJobs((prev) => [...prev, ...seeded])
+
+    void (async () => {
+      const iphone = isIphoneSafari()
+      const videos = seeded.filter((j) => j.mediaKind === 'video')
+      const photos = seeded.filter((j) => j.mediaKind !== 'video')
+
+      async function prepareOne(job: FileJob) {
+        if (!job.file) return
+        patchJob(job.id, {
+          status: 'preparing',
+          error: 'Preparing from Photos or iCloud…',
+        })
+        try {
+          const gate = await gateSelectedFile(job.file, limits)
+          if (!gate.ok) {
+            patchJob(job.id, { status: 'failed', error: gate.message, progress: 0 })
+            return
+          }
+          patchJob(job.id, {
+            status: 'ready',
+            error: undefined,
+            fileType: gate.mimeType,
+            uploadMimeType: gate.mimeType,
+            durationSeconds: gate.durationSeconds,
+            headerBase64: gate.headerBase64,
+            mediaKind: gate.mediaKind,
+          })
+        } catch {
+          patchJob(job.id, { status: 'failed', error: 'Unable to prepare file' })
+        }
+      }
+
+      const photoWorkers = Math.min(iphone ? 2 : 4, Math.max(1, photos.length || 1))
+      let photoIdx = 0
+      await Promise.all(
+        Array.from({ length: photos.length ? photoWorkers : 0 }, async () => {
+          while (photoIdx < photos.length) {
+            const j = photos[photoIdx++]
+            if (j) await prepareOne(j)
+          }
+        }),
+      )
+
+      // Sequential video prep — never decode all selected videos at once.
+      for (const j of videos) await prepareOne(j)
     })()
+  }
+
+  function retryModeFor(job: FileJob): 'full' | 'preview' | 'complete' {
+    if (
+      job.posterStatus === 'failed' ||
+      job.status === 'preview_failed' ||
+      (job.originalVerified && !job.hasPreview)
+    ) {
+      return 'preview'
+    }
+    if (job.sessionId && !job.originalVerified && (job.progress >= 100 || job.status === 'failed')) {
+      return 'complete'
+    }
+    return 'full'
   }
 
   async function runAll() {
     if (!token || !info || jobs.length === 0) return
     setBusy(true)
     setError(null)
-    for (const job of jobs) {
-      if (job.status === 'completed' && job.posterStatus !== 'failed') continue
-      const mode =
-        job.posterStatus === 'failed' ||
-        job.status === 'preview_failed' ||
-        (job.originalVerified && !job.hasPreview)
-          ? 'preview'
-          : job.status === 'original_failed' && job.sessionId
-            ? 'complete'
-            : 'full'
+
+    const iphone = isIphoneSafari()
+    const maxVideos = 1
+    const maxPhotos = iphone ? 2 : 3
+    let activeVideos = 0
+    let activePhotos = 0
+
+    const snapshot = () => jobsRef.current
+
+    async function runJob(job: FileJob) {
+      const kind = job.mediaKind ?? (job.file ? mediaKindOf(job.file) : 'image')
+      if (kind === 'video') activeVideos++
+      else activePhotos++
+      const mode = retryModeFor(job)
       try {
-        await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
+        const latest = snapshot().find((j) => j.id === job.id) ?? job
+        await uploadOne(token!, info!, latest, name, message, (patch) => patchJob(job.id, patch), mode)
       } catch (err) {
         const msg =
           err instanceof ApiError
@@ -774,30 +865,77 @@ export function UploadPage() {
             : err instanceof Error
               ? err.message
               : String(err)
+        const latest = snapshot().find((j) => j.id === job.id)
         patchJob(job.id, {
-          status: job.originalVerified ? 'preview_failed' : 'original_failed',
-          error: msg,
+          status: latest?.originalVerified ? 'preview_failed' : 'failed',
+          error: /load failed/i.test(msg) ? 'Original upload interrupted' : msg,
         })
+      } finally {
+        if (kind === 'video') activeVideos--
+        else activePhotos--
       }
     }
+
+    await new Promise<void>((resolve) => {
+      const inFlight = new Set<string>()
+      const tick = () => {
+        const current = snapshot()
+        const stillPreparing = current.some((j) => j.status === 'preparing' || j.status === 'selected')
+        const actionable = current.filter((j) => {
+          if (inFlight.has(j.id)) return false
+          if (j.status === 'ready') return true
+          if (j.status === 'preview_failed') return true
+          if (j.status === 'completed' && j.posterStatus === 'failed') return true
+          if (j.status === 'failed' && j.file) return true
+          return false
+        })
+
+        for (const job of actionable) {
+          const kind = job.mediaKind ?? (job.file ? mediaKindOf(job.file) : 'image')
+          if (kind === 'video' && activeVideos >= maxVideos) continue
+          if (kind !== 'video' && activePhotos >= maxPhotos) continue
+          inFlight.add(job.id)
+          void runJob(job).then(() => {
+            inFlight.delete(job.id)
+            tick()
+          })
+        }
+
+        const workLeft =
+          stillPreparing ||
+          inFlight.size > 0 ||
+          activeVideos > 0 ||
+          activePhotos > 0 ||
+          current.some(
+            (j) =>
+              j.status === 'ready' ||
+              j.status === 'uploading' ||
+              j.status === 'completing' ||
+              j.status === 'preparing_preview' ||
+              j.status === 'preview_failed' ||
+              (j.status === 'completed' && j.posterStatus === 'failed'),
+          )
+
+        if (!workLeft) {
+          resolve()
+          return
+        }
+        if (stillPreparing || actionable.length === 0) {
+          window.setTimeout(tick, 150)
+        }
+      }
+      tick()
+    })
+
     setBusy(false)
   }
 
   async function retryOne(id: string) {
     if (!token || !info) return
-    const job = jobs.find((j) => j.id === id)
+    const job = jobsRef.current.find((j) => j.id === id)
     if (!job) return
     setBusy(true)
-    const mode: 'full' | 'preview' | 'complete' =
-      job.posterStatus === 'failed' ||
-      job.status === 'preview_failed' ||
-      (job.originalVerified && !job.hasPreview)
-        ? 'preview'
-        : job.sessionId && job.status === 'original_failed'
-          ? 'complete'
-          : job.sessionId && !job.originalVerified && job.progress >= 100
-            ? 'complete'
-            : 'full'
+    const mode = retryModeFor(job)
     try {
       await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
     } catch (err) {
@@ -808,15 +946,29 @@ export function UploadPage() {
             ? err.message
             : String(err)
       patchJob(id, {
-        status: mode === 'preview' ? 'preview_failed' : 'original_failed',
-        error: msg,
+        status: mode === 'preview' ? 'preview_failed' : 'failed',
+        error: /load failed/i.test(msg) ? 'Original upload interrupted' : msg,
       })
     } finally {
       setBusy(false)
     }
   }
 
-  const allDone = jobs.length > 0 && jobs.every((j) => j.status === 'completed')
+  const allDone =
+    jobs.length > 0 &&
+    jobs.every((j) => j.status === 'completed') &&
+    !jobs.some((j) => j.posterStatus === 'failed')
+
+  const canUpload =
+    !busy &&
+    info?.uploadsEnabled !== false &&
+    jobs.some(
+      (j) =>
+        j.status === 'ready' ||
+        j.status === 'preview_failed' ||
+        j.posterStatus === 'failed' ||
+        (j.status === 'failed' && Boolean(j.file)),
+    )
 
   return (
     <main className="invite-linen relative min-h-dvh px-6 py-12 pb-[max(2rem,env(safe-area-inset-bottom))]">
@@ -864,6 +1016,9 @@ export function UploadPage() {
               onChange={(e) => onPick(e.target.files)}
               className="mt-2 block w-full text-sm text-mist file:mr-4 file:rounded-[11px] file:border-0 file:bg-lux-gold-dark file:px-4 file:py-2 file:font-label file:text-[10px] file:uppercase file:tracking-[0.28em] file:text-white"
             />
+            <p className="mt-2 font-body text-xs text-mist">
+              Photos and videos stored in iCloud may take a moment to prepare. Keep this page open.
+            </p>
           </label>
         </div>
 
@@ -883,7 +1038,8 @@ export function UploadPage() {
                 {job.error ? (
                   <p
                     className={`mt-2 text-xs ${
-                      job.posterStatus === 'failed' && job.status === 'completed'
+                      job.status === 'preparing' ||
+                      (job.posterStatus === 'failed' && job.status === 'completed')
                         ? 'text-mist'
                         : 'text-red-800'
                     }`}
@@ -893,7 +1049,7 @@ export function UploadPage() {
                 ) : null}
                 {!job.file &&
                 (job.status === 'preview_failed' ||
-                  job.status === 'original_failed' ||
+                  job.status === 'failed' ||
                   job.posterStatus === 'failed') ? (
                   <p className="mt-2 text-xs text-mist">Re-select the same file to retry.</p>
                 ) : null}
@@ -908,7 +1064,7 @@ export function UploadPage() {
                     Retry preview
                   </button>
                 ) : null}
-                {job.status === 'original_failed' ? (
+                {job.status === 'failed' ? (
                   <button
                     type="button"
                     className="mt-2 font-label text-[10px] uppercase tracking-[0.24em] text-lux-gold-dark underline-offset-2 hover:underline"
@@ -927,7 +1083,7 @@ export function UploadPage() {
 
         <button
           type="button"
-          disabled={busy || jobs.length === 0 || info?.uploadsEnabled === false}
+          disabled={!canUpload}
           onClick={() => void runAll()}
           className="btn-luxury mt-8 inline-flex min-h-11 w-full items-center justify-center rounded-[11px] bg-lux-gold-dark px-10 font-label text-[11px] uppercase tracking-[0.34em] text-white disabled:opacity-50"
         >

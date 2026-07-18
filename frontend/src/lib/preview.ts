@@ -107,10 +107,11 @@ export async function makeImagePreview(file: File): Promise<{ blob: Blob; conten
 
 export async function makeVideoPoster(file: File): Promise<{ blob: Blob; contentType: string } | null> {
   const url = URL.createObjectURL(file)
+  const video = document.createElement('video')
   try {
-    const video = document.createElement('video')
     video.muted = true
     video.playsInline = true
+    video.preload = 'metadata'
     video.src = url
     await new Promise<void>((resolve, reject) => {
       video.onloadeddata = () => resolve()
@@ -123,6 +124,8 @@ export async function makeVideoPoster(file: File): Promise<{ blob: Blob; content
     const canvas = drawToCanvas(video, video.videoWidth || 640, video.videoHeight || 360)
     try {
       const blob = await canvasToJpegBlob(canvas, 0.75)
+      canvas.width = 0
+      canvas.height = 0
       return { blob, contentType: 'image/jpeg' }
     } catch {
       return null
@@ -130,6 +133,8 @@ export async function makeVideoPoster(file: File): Promise<{ blob: Blob; content
   } catch {
     return null
   } finally {
+    video.removeAttribute('src')
+    video.load()
     URL.revokeObjectURL(url)
   }
 }

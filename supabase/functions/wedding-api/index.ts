@@ -3,11 +3,13 @@ import { corsHeaders, json, newRequestId, safeErrorMessage } from '../_shared/ht
 import {
   adminCapacityView,
   canCreateOriginalUpload,
+  MAX_VIDEO_BYTES,
   type CapacitySettings,
 } from '../_shared/capacity.ts'
 import { DEFAULT_CHUNK_BYTES } from '../_shared/chunks.ts'
 import { mintGuestToken, verifyGuestToken } from '../_shared/guest_token.ts'
 import { previewObjectPath, validateUploadMeta } from '../_shared/upload_validation.ts'
+import { DEFAULT_SAFETY_RESERVE_BYTES } from '../_shared/upload_limits.ts'
 import { hashAccessCode, timingSafeEqual } from '../_shared/access_code.ts'
 import { adminSecretConfigured, resolveAdminAuth } from '../_shared/admin_auth.ts'
 import {
@@ -106,13 +108,14 @@ async function loadEventSettings(sb: ReturnType<typeof adminClient>) {
     .maybeSingle()
   if (!data) throw new Error('event_missing')
   const settings: CapacitySettings = {
-    safetyReserveBytes: Number(data.upload_safety_reserve_bytes ?? 104857600),
+    safetyReserveBytes: Number(data.upload_safety_reserve_bytes ?? DEFAULT_SAFETY_RESERVE_BYTES),
     videoUploadsEnabled: data.video_uploads_enabled !== false,
     warnRatio: Number(data.capacity_warn_ratio ?? 0.2),
     criticalRatio: Number(data.capacity_critical_ratio ?? 0.1),
     uploadsEnabled: data.uploads_enabled !== false,
     maxImageBytes: Number(data.max_image_bytes ?? 20 * 1024 * 1024),
-    maxVideoBytes: Number(data.max_video_bytes ?? 100 * 1024 * 1024),
+    // Product video ceiling is the shared constant (not the Drive plan size).
+    maxVideoBytes: MAX_VIDEO_BYTES,
   }
   return {
     eventId: data.id as string,
@@ -712,7 +715,7 @@ Deno.serve(async (req) => {
         byteSize: Number(body.byteSize),
         mediaKind,
         maxImageBytes: settings.maxImageBytes ?? 20 * 1024 * 1024,
-        maxVideoBytes: settings.maxVideoBytes ?? 100 * 1024 * 1024,
+        maxVideoBytes: MAX_VIDEO_BYTES,
         durationSeconds: body.durationSeconds,
         maxVideoDurationSeconds,
         headerBytes,
