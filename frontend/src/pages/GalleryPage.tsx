@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import { Play } from 'lucide-react'
 import { apiJson } from '../lib/api'
 import { getGuestToken } from '../lib/session'
 
@@ -123,11 +124,27 @@ export function GalleryPage() {
                   className="h-full w-full object-cover transition duration-500 group-hover:scale-[1.03]"
                 />
               ) : (
-                <div className="flex h-full items-center justify-center px-3 text-center font-label text-[10px] tracking-[0.2em] text-lux-gold-dark">
-                  {item.mediaKind === 'video' ? 'Video' : 'Photo'}
+                <div className="flex h-full flex-col items-center justify-center gap-2 bg-gradient-to-b from-white/40 to-lux-gold/10 px-3 text-center">
+                  {item.mediaKind === 'video' ? (
+                    <>
+                      <span
+                        className="flex h-10 w-10 items-center justify-center rounded-full border border-lux-gold/40 bg-white/70 text-lux-gold-dark"
+                        aria-hidden
+                      >
+                        <Play className="h-4 w-4 fill-current" />
+                      </span>
+                      <span className="font-label text-[10px] tracking-[0.2em] text-lux-gold-dark">
+                        Video
+                      </span>
+                    </>
+                  ) : (
+                    <span className="font-label text-[10px] tracking-[0.2em] text-lux-gold-dark">
+                      Photo
+                    </span>
+                  )}
                 </div>
               )}
-              {item.mediaKind === 'video' ? (
+              {item.mediaKind === 'video' && item.previewUrl ? (
                 <span className="absolute bottom-2 left-2 rounded bg-black/45 px-2 py-0.5 font-label text-[9px] uppercase tracking-[0.2em] text-white">
                   Video
                 </span>
@@ -157,6 +174,13 @@ export function GalleryPage() {
           >
             {active.previewUrl ? (
               <img src={active.previewUrl} alt="" className="mx-auto max-h-[70dvh] w-auto rounded-[10px]" />
+            ) : active.mediaKind === 'video' ? (
+              <div className="mx-auto flex aspect-video max-h-[40dvh] w-full max-w-md flex-col items-center justify-center gap-3 rounded-[10px] bg-white/70">
+                <Play className="h-8 w-8 text-lux-gold-dark" aria-hidden />
+                <p className="font-label text-[10px] uppercase tracking-[0.28em] text-lux-gold-dark">
+                  Video preview unavailable
+                </p>
+              </div>
             ) : null}
             <p className="mt-4 font-display text-xl text-lux-gold-dark">{active.guestName || 'Guest'}</p>
             {active.guestMessage ? (

@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ApiError, apiJson, logApi } from '../lib/api'
+import {
+  gateSelectedFile,
+  mediaKindOf,
+  userMessageForUploadError,
+} from '../lib/mediaValidate'
 import { blobToBase64, makeImagePreview, makeVideoPoster } from '../lib/preview'
 import { putResumableFile, queryResumableOffset } from '../lib/resumableUpload'
 import { getGuestToken } from '../lib/session'
@@ -10,6 +15,7 @@ type EventPublic = {
   videoUploadsEnabled: boolean
   maxImageBytes: number
   maxVideoBytes: number
+  maxVideoDurationSeconds?: number
   uploadsPausedReason: string | null
   reconnectRequired: boolean
 }
@@ -32,6 +38,10 @@ type FileJob = {
   fileName: string
   fileSize: number
   fileType: string
+  /** Resolved MIME sent to the API (may differ from File.type for MOV). */
+  uploadMimeType?: string
+  durationSeconds?: number | null
+  headerBase64?: string | null
   progress: number
   status: UploadStage
   error?: string
@@ -41,6 +51,7 @@ type FileJob = {
   fileId?: string | null
   originalVerified?: boolean
   hasPreview?: boolean
+  posterStatus?: 'ok' | 'failed' | 'skipped'
 }
 
 type PersistedJob = {
@@ -175,7 +186,7 @@ async function uploadPreviewFor(
 ): Promise<void> {
   if (!job.file) throw new Error('Re-select this file to retry the preview.')
   if (!job.mediaId) throw new Error('missing_media_id')
-  const mediaKind = job.fileType.startsWith('video/') ? 'video' : 'image'
+  const mediaKind = mediaKindOf(job.file)
   onUpdate({ status: 'generating_preview', error: undefined })
   if (mediaKind === 'image') {
     let preview: { blob: Blob; contentType: string }
@@ -197,25 +208,52 @@ async function uploadPreviewFor(
         kind: 'image',
       }),
     })
-  } else {
-    const poster = await makeVideoPoster(job.file)
-    if (poster) {
-      onUpdate({ status: 'uploading_preview' })
-      const base64 = await blobToBase64(poster.blob)
-      await apiJson('gdrive-upload-preview', {
-        method: 'POST',
-        guestToken: token,
-        stage: 'uploading_preview',
-        body: JSON.stringify({
-          mediaId: job.mediaId,
-          base64,
-          contentType: poster.contentType,
-          kind: 'poster',
-        }),
-      })
-    }
+    onUpdate({ status: 'completed', progress: 100, hasPreview: true, error: undefined })
+    return
   }
-  onUpdate({ status: 'completed', progress: 100, hasPreview: true, error: undefined })
+
+  // Video: poster is best-effort — original success must not depend on it.
+  const poster = await makeVideoPoster(job.file)
+  if (!poster) {
+    onUpdate({
+      status: 'completed',
+      progress: 100,
+      hasPreview: false,
+      posterStatus: 'failed',
+      error: 'Video saved, but its preview could not be generated.',
+    })
+    return
+  }
+  onUpdate({ status: 'uploading_preview' })
+  try {
+    const base64 = await blobToBase64(poster.blob)
+    await apiJson('gdrive-upload-preview', {
+      method: 'POST',
+      guestToken: token,
+      stage: 'uploading_preview',
+      body: JSON.stringify({
+        mediaId: job.mediaId,
+        base64,
+        contentType: poster.contentType,
+        kind: 'poster',
+      }),
+    })
+    onUpdate({
+      status: 'completed',
+      progress: 100,
+      hasPreview: true,
+      posterStatus: 'ok',
+      error: undefined,
+    })
+  } catch {
+    onUpdate({
+      status: 'completed',
+      progress: 100,
+      hasPreview: false,
+      posterStatus: 'failed',
+      error: 'Video saved, but its preview could not be generated.',
+    })
+  }
 }
 
 async function uploadOne(
@@ -283,9 +321,9 @@ async function uploadOne(
 
   const file = job.file
   if (!file) throw new Error('Re-select this file to upload.')
-  const mediaKind = file.type.startsWith('video/') ? 'video' : 'image'
+  const mediaKind = mediaKindOf(file)
   if (mediaKind === 'video' && !info.videoUploadsEnabled) {
-    throw new Error('Video uploads are temporarily disabled.')
+    throw new Error('Video uploads are currently disabled.')
   }
   if (!info.uploadsEnabled) {
     throw new Error(info.uploadsPausedReason || 'Uploads are paused.')
@@ -367,13 +405,15 @@ async function uploadOne(
       guestToken: token,
       stage: 'create_upload_session',
       body: JSON.stringify({
-        mimeType: file.type,
+        mimeType: job.uploadMimeType || file.type,
         filename: file.name,
         byteSize: file.size,
         mediaKind,
         idempotencyKey: job.id,
         guestName: name || undefined,
         guestMessage: message || undefined,
+        durationSeconds: job.durationSeconds ?? undefined,
+        headerBase64: job.headerBase64 ?? undefined,
       }),
     })
     sessionId = session.sessionId
@@ -641,34 +681,74 @@ export function UploadPage() {
 
   function onPick(files: FileList | null) {
     if (!files?.length) return
-    setJobs((prev) => {
-      const next = [...prev]
-      for (const file of files) {
-        // Re-attach file to a matching preview_failed / original_failed job without file
-        const orphan = next.find(
+    const list = Array.from(files)
+    void (async () => {
+      const limits = {
+        uploadsEnabled: info?.uploadsEnabled !== false,
+        videoUploadsEnabled: info?.videoUploadsEnabled !== false,
+        maxImageBytes: info?.maxImageBytes ?? 20 * 1024 * 1024,
+        maxVideoBytes: info?.maxVideoBytes ?? 100 * 1024 * 1024,
+        maxVideoDurationSeconds: info?.maxVideoDurationSeconds ?? 60,
+        uploadsPausedReason: info?.uploadsPausedReason ?? null,
+      }
+      const additions: FileJob[] = []
+      for (const file of list) {
+        const orphanMatch = jobs.find(
           (j) =>
             !j.file &&
             j.fileName === file.name &&
             j.fileSize === file.size &&
-            (j.status === 'preview_failed' || j.status === 'original_failed'),
+            (j.status === 'preview_failed' || j.status === 'original_failed' || j.posterStatus === 'failed'),
         )
-        if (orphan) {
-          orphan.file = file
-          orphan.error = orphan.status === 'preview_failed' ? 'Original saved; preview failed' : orphan.error
+        if (orphanMatch) {
+          setJobs((prev) =>
+            prev.map((j) =>
+              j.id === orphanMatch.id
+                ? {
+                    ...j,
+                    file,
+                    error:
+                      j.posterStatus === 'failed'
+                        ? 'Video saved, but its preview could not be generated.'
+                        : j.status === 'preview_failed'
+                          ? 'Original saved; preview failed'
+                          : j.error,
+                  }
+                : j,
+            ),
+          )
           continue
         }
-        next.push({
+
+        const gate = await gateSelectedFile(file, limits)
+        if (!gate.ok) {
+          additions.push({
+            id: crypto.randomUUID(),
+            file,
+            fileName: file.name,
+            fileSize: file.size,
+            fileType: file.type || gate.code,
+            progress: 0,
+            status: 'original_failed',
+            error: gate.message,
+          })
+          continue
+        }
+        additions.push({
           id: crypto.randomUUID(),
           file,
           fileName: file.name,
           fileSize: file.size,
-          fileType: file.type,
+          fileType: gate.mimeType,
+          uploadMimeType: gate.mimeType,
+          durationSeconds: gate.durationSeconds,
+          headerBase64: gate.headerBase64,
           progress: 0,
           status: 'queued',
         })
       }
-      return [...next]
-    })
+      if (additions.length) setJobs((prev) => [...prev, ...additions])
+    })()
   }
 
   async function runAll() {
@@ -676,9 +756,11 @@ export function UploadPage() {
     setBusy(true)
     setError(null)
     for (const job of jobs) {
-      if (job.status === 'completed') continue
+      if (job.status === 'completed' && job.posterStatus !== 'failed') continue
       const mode =
-        job.status === 'preview_failed' || job.originalVerified
+        job.posterStatus === 'failed' ||
+        job.status === 'preview_failed' ||
+        (job.originalVerified && !job.hasPreview)
           ? 'preview'
           : job.status === 'original_failed' && job.sessionId
             ? 'complete'
@@ -686,9 +768,15 @@ export function UploadPage() {
       try {
         await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
       } catch (err) {
+        const msg =
+          err instanceof ApiError
+            ? userMessageForUploadError(err.code, err.message)
+            : err instanceof Error
+              ? err.message
+              : String(err)
         patchJob(job.id, {
           status: job.originalVerified ? 'preview_failed' : 'original_failed',
-          error: err instanceof Error ? err.message : String(err),
+          error: msg,
         })
       }
     }
@@ -701,7 +789,9 @@ export function UploadPage() {
     if (!job) return
     setBusy(true)
     const mode: 'full' | 'preview' | 'complete' =
-      job.status === 'preview_failed' || (job.originalVerified && !job.hasPreview)
+      job.posterStatus === 'failed' ||
+      job.status === 'preview_failed' ||
+      (job.originalVerified && !job.hasPreview)
         ? 'preview'
         : job.sessionId && job.status === 'original_failed'
           ? 'complete'
@@ -711,9 +801,15 @@ export function UploadPage() {
     try {
       await uploadOne(token, info, job, name, message, (patch) => patchJob(job.id, patch), mode)
     } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? userMessageForUploadError(err.code, err.message)
+          : err instanceof Error
+            ? err.message
+            : String(err)
       patchJob(id, {
         status: mode === 'preview' ? 'preview_failed' : 'original_failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: msg,
       })
     } finally {
       setBusy(false)
@@ -764,7 +860,7 @@ export function UploadPage() {
             <input
               type="file"
               multiple
-              accept="image/jpeg,image/png,image/webp,video/mp4"
+              accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,.mp4,.mov"
               onChange={(e) => onPick(e.target.files)}
               className="mt-2 block w-full text-sm text-mist file:mr-4 file:rounded-[11px] file:border-0 file:bg-lux-gold-dark file:px-4 file:py-2 file:font-label file:text-[10px] file:uppercase file:tracking-[0.28em] file:text-white"
             />
@@ -784,11 +880,25 @@ export function UploadPage() {
                 <div className="mt-2 h-2 overflow-hidden rounded-full bg-white/80">
                   <div className="h-full bg-lux-gold-dark transition-all" style={{ width: `${job.progress}%` }} />
                 </div>
-                {job.error ? <p className="mt-2 text-xs text-red-800">{job.error}</p> : null}
-                {!job.file && (job.status === 'preview_failed' || job.status === 'original_failed') ? (
+                {job.error ? (
+                  <p
+                    className={`mt-2 text-xs ${
+                      job.posterStatus === 'failed' && job.status === 'completed'
+                        ? 'text-mist'
+                        : 'text-red-800'
+                    }`}
+                  >
+                    {job.error}
+                  </p>
+                ) : null}
+                {!job.file &&
+                (job.status === 'preview_failed' ||
+                  job.status === 'original_failed' ||
+                  job.posterStatus === 'failed') ? (
                   <p className="mt-2 text-xs text-mist">Re-select the same file to retry.</p>
                 ) : null}
-                {job.status === 'preview_failed' ? (
+                {job.status === 'preview_failed' ||
+                (job.status === 'completed' && job.posterStatus === 'failed') ? (
                   <button
                     type="button"
                     className="mt-2 font-label text-[10px] uppercase tracking-[0.24em] text-lux-gold-dark underline-offset-2 hover:underline"
