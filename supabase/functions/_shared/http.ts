@@ -15,8 +15,10 @@ export function corsHeaders(origin: string | null): HeadersInit {
   return {
     'Access-Control-Allow-Origin': allow,
     'Access-Control-Allow-Headers':
-      'authorization, x-client-info, apikey, content-type, x-request-id, x-guest-token, x-admin-secret, x-idempotency-key',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
+      'authorization, x-client-info, apikey, content-type, x-request-id, x-guest-token, x-admin-secret, x-idempotency-key, range',
+    'Access-Control-Allow-Methods': 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS',
+    'Access-Control-Expose-Headers':
+      'Accept-Ranges, Content-Range, Content-Length, Content-Type, Content-Disposition, x-request-id',
     Vary: 'Origin',
   }
 }
@@ -44,5 +46,12 @@ export function newRequestId(): string {
 /** Never log tokens / secrets. */
 export function safeErrorMessage(err: unknown): string {
   if (err instanceof Error) return err.message.replace(/Bearer\s+\S+/gi, '[redacted]')
+  if (err && typeof err === 'object') {
+    const o = err as { message?: unknown; code?: unknown; details?: unknown; hint?: unknown }
+    const parts = [o.message, o.code, o.details, o.hint]
+      .filter((v) => typeof v === 'string' && v.length > 0)
+      .map((v) => String(v).replace(/Bearer\s+\S+/gi, '[redacted]'))
+    if (parts.length) return parts.join(' | ')
+  }
   return 'Unexpected error'
 }
