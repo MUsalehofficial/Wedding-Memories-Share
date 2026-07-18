@@ -1,5 +1,7 @@
 /** MIME / extension / size validation before Drive session creation. */
 
+import { isIsoBmffContainer } from './iso_bmff.ts'
+
 const IMAGE_EXT: Record<string, string> = {
   jpg: 'image/jpeg',
   jpeg: 'image/jpeg',
@@ -7,8 +9,10 @@ const IMAGE_EXT: Record<string, string> = {
   webp: 'image/webp',
 }
 
-const VIDEO_EXT: Record<string, string> = {
-  mp4: 'video/mp4',
+/** Primary MIME per extension; MOV also accepts video/mp4 from some browsers. */
+const VIDEO_COMPATIBLE_MIMES: Record<string, ReadonlySet<string>> = {
+  mp4: new Set(['video/mp4']),
+  mov: new Set(['video/quicktime', 'video/mp4']),
 }
 
 export type UploadMetaInput = {
@@ -18,6 +22,11 @@ export type UploadMetaInput = {
   mediaKind: 'image' | 'video'
   maxImageBytes: number
   maxVideoBytes: number
+  /** Optional client-reported duration (seconds). */
+  durationSeconds?: number | null
+  maxVideoDurationSeconds?: number | null
+  /** First bytes of the file for container verification (videos). */
+  headerBytes?: Uint8Array | null
   /** Guests must never supply this — reject if present. */
   parentFolderId?: string | null
   parents?: unknown
@@ -31,6 +40,17 @@ export function extensionOf(filename: string): string {
   const i = base.lastIndexOf('.')
   if (i < 0) return ''
   return base.slice(i + 1).toLowerCase()
+}
+
+/** Resolve Drive/content MIME for a validated video extension + browser type. */
+export function resolveVideoMimeType(ext: string, browserMime: string): string {
+  const mime = (browserMime || '').toLowerCase().trim()
+  if (ext === 'mov') {
+    if (mime === 'video/quicktime' || mime === 'video/mp4') return mime
+    return 'video/quicktime'
+  }
+  if (ext === 'mp4') return 'video/mp4'
+  return mime || 'application/octet-stream'
 }
 
 export function validateUploadMeta(input: UploadMetaInput): ValidationOk | ValidationFail {
@@ -54,8 +74,78 @@ export function validateUploadMeta(input: UploadMetaInput): ValidationOk | Valid
   }
 
   const ext = extensionOf(input.filename)
-  const allowedMap = input.mediaKind === 'video' ? VIDEO_EXT : IMAGE_EXT
-  const expectedMime = allowedMap[ext]
+  const mime = (input.mimeType || '').toLowerCase().trim()
+
+  if (input.mediaKind === 'video') {
+    const allowed = VIDEO_COMPATIBLE_MIMES[ext]
+    if (!allowed) {
+      return {
+        ok: false,
+        code: 'disallowed_extension',
+        message: 'This video format is not supported.',
+      }
+    }
+    // Empty MIME from some pickers: allow when extension is a known video type.
+    if (mime !== '' && !allowed.has(mime)) {
+      return {
+        ok: false,
+        code: 'unsupported_mime',
+        message: 'This video format is not supported.',
+      }
+    }
+    if (mime === '' && ext !== 'mov' && ext !== 'mp4') {
+      return {
+        ok: false,
+        code: 'unsupported_mime',
+        message: 'This video format is not supported.',
+      }
+    }
+
+    const resolved = resolveVideoMimeType(ext, mime || (ext === 'mov' ? 'video/quicktime' : 'video/mp4'))
+
+    if (input.byteSize > input.maxVideoBytes) {
+      return {
+        ok: false,
+        code: 'exceeds_configured_max',
+        message: 'This video is too large.',
+      }
+    }
+
+    const maxDur = input.maxVideoDurationSeconds
+    if (
+      maxDur != null &&
+      Number.isFinite(maxDur) &&
+      maxDur > 0 &&
+      input.durationSeconds != null &&
+      Number.isFinite(input.durationSeconds) &&
+      input.durationSeconds > maxDur
+    ) {
+      return {
+        ok: false,
+        code: 'exceeds_duration_max',
+        message: 'This video is too long.',
+      }
+    }
+
+    if (!input.headerBytes || input.headerBytes.byteLength < 12) {
+      return {
+        ok: false,
+        code: 'invalid_video_container',
+        message: 'This video format is not supported.',
+      }
+    }
+    if (!isIsoBmffContainer(input.headerBytes)) {
+      return {
+        ok: false,
+        code: 'invalid_video_container',
+        message: 'This video format is not supported.',
+      }
+    }
+
+    return { ok: true, ext, mimeType: resolved }
+  }
+
+  const expectedMime = IMAGE_EXT[ext]
   if (!expectedMime) {
     return {
       ok: false,
@@ -64,8 +154,7 @@ export function validateUploadMeta(input: UploadMetaInput): ValidationOk | Valid
     }
   }
 
-  const mime = (input.mimeType || '').toLowerCase().trim()
-  const allowedMimes = new Set(Object.values(allowedMap))
+  const allowedMimes = new Set(Object.values(IMAGE_EXT))
   if (!allowedMimes.has(mime)) {
     return { ok: false, code: 'unsupported_mime', message: `MIME type ${mime} is not supported.` }
   }
@@ -78,8 +167,7 @@ export function validateUploadMeta(input: UploadMetaInput): ValidationOk | Valid
     }
   }
 
-  const max = input.mediaKind === 'video' ? input.maxVideoBytes : input.maxImageBytes
-  if (input.byteSize > max) {
+  if (input.byteSize > input.maxImageBytes) {
     return {
       ok: false,
       code: 'exceeds_configured_max',
@@ -95,3 +183,5 @@ export function previewObjectPath(eventId: string, mediaId: string, kind: 'image
   const suffix = kind === 'poster' ? 'poster.jpg' : 'preview.webp'
   return `${eventId}/${mediaId}/${stamp}_${suffix}`
 }
+
+export { isIsoBmffContainer } from './iso_bmff.ts'

@@ -100,7 +100,7 @@ async function loadEventSettings(sb: ReturnType<typeof adminClient>) {
   const { data } = await sb
     .from('events')
     .select(
-      'id, couple_names, gallery_enabled, video_uploads_enabled, upload_safety_reserve_bytes, capacity_warn_ratio, capacity_critical_ratio, uploads_enabled, max_image_bytes, max_video_bytes, access_code_hash, access_code_salt, moderation_enabled, guest_token_version',
+      'id, couple_names, gallery_enabled, video_uploads_enabled, upload_safety_reserve_bytes, capacity_warn_ratio, capacity_critical_ratio, uploads_enabled, max_image_bytes, max_video_bytes, max_video_duration_seconds, access_code_hash, access_code_salt, moderation_enabled, guest_token_version',
     )
     .eq('slug', 'muhammad-basmala')
     .maybeSingle()
@@ -123,6 +123,7 @@ async function loadEventSettings(sb: ReturnType<typeof adminClient>) {
     accessCodeSalt: data.access_code_salt as string,
     moderationEnabled: data.moderation_enabled === true,
     guestTokenVersion: Number(data.guest_token_version ?? 1),
+    maxVideoDurationSeconds: Number(data.max_video_duration_seconds ?? 60),
   }
 }
 
@@ -481,7 +482,8 @@ Deno.serve(async (req) => {
 
     if (route === 'event-public' && req.method === 'GET') {
       const sb = adminClient()
-      const { eventId, coupleNames, galleryEnabled, settings } = await loadEventSettings(sb)
+      const { eventId, coupleNames, galleryEnabled, settings, maxVideoDurationSeconds } =
+        await loadEventSettings(sb)
       const { data: integ } = await sb
         .from('google_drive_integrations')
         .select('status, last_error')
@@ -496,6 +498,7 @@ Deno.serve(async (req) => {
           videoUploadsEnabled: settings.videoUploadsEnabled,
           maxImageBytes: settings.maxImageBytes,
           maxVideoBytes: settings.maxVideoBytes,
+          maxVideoDurationSeconds,
           driveStatus: integ?.status ?? 'disconnected',
           reconnectRequired,
           uploadsPausedReason: reconnectRequired
@@ -610,9 +613,10 @@ Deno.serve(async (req) => {
           guestMessage: row.guest_message,
           mimeType: row.mime_type,
           createdAt: row.created_at,
-          hasPreview: Boolean(path),
+          // Posterless videos still appear; hasPreview reflects signed poster/preview URL.
+          hasPreview: Boolean(previewUrl),
           previewUrl,
-          previewExpiresInSec: path ? SIGNED_TTL_SEC : null,
+          previewExpiresInSec: previewUrl ? SIGNED_TTL_SEC : null,
         })
       }
       return json({ items, sort, requestId }, 200, origin, requestId)
@@ -678,13 +682,30 @@ Deno.serve(async (req) => {
         parents?: unknown
         guestName?: string
         guestMessage?: string
+        durationSeconds?: number
+        headerBase64?: string
       }
       const sb = adminClient()
-      const { eventId, settings, guestTokenVersion } = await loadEventSettings(sb)
+      const { eventId, settings, guestTokenVersion, maxVideoDurationSeconds } = await loadEventSettings(sb)
       const guest = await requireGuest(req, eventId, guestTokenVersion)
       if (!guest.ok) return guest.response
 
       const mediaKind = body.mediaKind === 'video' ? 'video' : 'image'
+      let headerBytes: Uint8Array | null = null
+      if (body.headerBase64) {
+        try {
+          const bin = atob(body.headerBase64)
+          headerBytes = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) headerBytes[i] = bin.charCodeAt(i)
+        } catch {
+          return json(
+            { error: 'invalid_video_container', message: 'This video format is not supported.', requestId },
+            400,
+            origin,
+            requestId,
+          )
+        }
+      }
       const meta = validateUploadMeta({
         mimeType: body.mimeType ?? '',
         filename: body.filename ?? '',
@@ -692,6 +713,9 @@ Deno.serve(async (req) => {
         mediaKind,
         maxImageBytes: settings.maxImageBytes ?? 20 * 1024 * 1024,
         maxVideoBytes: settings.maxVideoBytes ?? 100 * 1024 * 1024,
+        durationSeconds: body.durationSeconds,
+        maxVideoDurationSeconds,
+        headerBytes,
         parentFolderId: body.parentFolderId,
         parents: body.parents,
       })
@@ -802,6 +826,10 @@ Deno.serve(async (req) => {
           moderation_status: 'pending',
           guest_name: (body.guestName || body.filename || 'Guest').slice(0, 180),
           guest_message: body.guestMessage?.slice(0, 500) ?? null,
+          duration_seconds:
+            mediaKind === 'video' && body.durationSeconds != null && Number.isFinite(body.durationSeconds)
+              ? body.durationSeconds
+              : null,
         })
         .select('id')
         .single()
