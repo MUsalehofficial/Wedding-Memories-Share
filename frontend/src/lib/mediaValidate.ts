@@ -1,5 +1,13 @@
 /** Client-side media gate before starting a Drive upload session. */
 
+import {
+  MAX_VIDEO_BYTES,
+  VIDEO_STORAGE_FULL_MESSAGE,
+  VIDEO_TOO_LARGE_MESSAGE,
+} from '@upload-limits'
+
+export { MAX_VIDEO_BYTES, VIDEO_TOO_LARGE_MESSAGE, VIDEO_STORAGE_FULL_MESSAGE }
+
 const IMAGE_EXT = new Set(['jpg', 'jpeg', 'png', 'webp'])
 const VIDEO_COMPAT: Record<string, ReadonlySet<string>> = {
   mp4: new Set(['video/mp4']),
@@ -24,6 +32,9 @@ const ACCEPTABLE_BRANDS = new Set([
   'mmp4',
   'mp71',
 ])
+
+/** Header probe size — never read the whole video. */
+export const VIDEO_HEADER_BYTES = 65536
 
 export type PublicUploadLimits = {
   uploadsEnabled: boolean
@@ -79,10 +90,9 @@ function readFourCC(bytes: Uint8Array, offset: number): string {
   )
 }
 
-/** Shared with server: ISO BMFF / QuickTime ftyp probe. */
 export function isIsoBmffContainer(bytes: Uint8Array): boolean {
   if (bytes.byteLength < 12) return false
-  const limit = Math.min(bytes.byteLength, 64 * 1024)
+  const limit = Math.min(bytes.byteLength, VIDEO_HEADER_BYTES)
   let offset = 0
   while (offset + 8 <= limit) {
     let size = readU32BE(bytes, offset)
@@ -117,7 +127,10 @@ export function isIsoBmffContainer(bytes: Uint8Array): boolean {
   return false
 }
 
-export async function readFileHeader(file: File, maxBytes = 64 * 1024): Promise<Uint8Array> {
+export async function readFileHeader(
+  file: File,
+  maxBytes = VIDEO_HEADER_BYTES,
+): Promise<Uint8Array> {
   const slice = file.slice(0, Math.min(maxBytes, Math.max(file.size, 0)))
   return new Uint8Array(await slice.arrayBuffer())
 }
@@ -133,6 +146,8 @@ export function probeVideoDuration(file: File): Promise<number | null> {
     const done = (value: number | null) => {
       if (settled) return
       settled = true
+      video.removeAttribute('src')
+      video.load()
       URL.revokeObjectURL(url)
       resolve(value)
     }
@@ -163,13 +178,21 @@ export function userMessageForUploadError(code: string, fallback?: string): stri
     case 'unsupported_mime':
     case 'mime_extension_mismatch':
     case 'invalid_video_container':
-      return 'This video format is not supported.'
+      return 'Unsupported video format'
     case 'exceeds_configured_max':
-      return 'This video is too large.'
+    case 'exceeds_max_upload_size':
+      return VIDEO_TOO_LARGE_MESSAGE
     case 'exceeds_duration_max':
-      return 'This video is too long.'
+      return 'Video exceeds duration limit'
+    case 'storage_full':
+    case 'quota_unknown':
+      return VIDEO_STORAGE_FULL_MESSAGE
     case 'video_uploads_disabled':
       return 'Video uploads are currently disabled.'
+    case 'upload_incomplete':
+      return 'Original upload interrupted'
+    case 'missing_file_id':
+      return 'Completion verification failed'
     default:
       return fallback || code
   }
@@ -203,13 +226,13 @@ export async function gateSelectedFile(
   }
 
   if (!Number.isFinite(file.size) || file.size <= 0) {
-    return { ok: false, code: 'invalid_size', message: 'This file type is not supported.' }
+    return { ok: false, code: 'invalid_size', message: 'Unable to prepare file' }
   }
 
   if (mediaKind === 'image') {
     const ext = extensionOf(file.name)
     if (!IMAGE_EXT.has(ext)) {
-      return { ok: false, code: 'disallowed_extension', message: 'This file type is not supported.' }
+      return { ok: false, code: 'disallowed_extension', message: 'Unable to prepare file' }
     }
     if (file.size > limits.maxImageBytes) {
       return { ok: false, code: 'exceeds_configured_max', message: 'This photo is too large.' }
@@ -230,7 +253,7 @@ export async function gateSelectedFile(
     return {
       ok: false,
       code: 'disallowed_extension',
-      message: 'This video format is not supported.',
+      message: 'Unsupported video format',
     }
   }
   const browserMime = (file.type || '').toLowerCase().trim()
@@ -238,19 +261,26 @@ export async function gateSelectedFile(
     return {
       ok: false,
       code: 'unsupported_mime',
-      message: 'This video format is not supported.',
+      message: 'Unsupported video format',
     }
   }
-  if (file.size > limits.maxVideoBytes) {
-    return { ok: false, code: 'exceeds_configured_max', message: 'This video is too large.' }
+
+  const videoCap = Math.min(MAX_VIDEO_BYTES, limits.maxVideoBytes || MAX_VIDEO_BYTES)
+  if (file.size > videoCap) {
+    return { ok: false, code: 'exceeds_configured_max', message: VIDEO_TOO_LARGE_MESSAGE }
   }
 
-  const header = await readFileHeader(file)
+  let header: Uint8Array
+  try {
+    header = await readFileHeader(file, VIDEO_HEADER_BYTES)
+  } catch {
+    return { ok: false, code: 'prepare_failed', message: 'Unable to prepare file' }
+  }
   if (!isIsoBmffContainer(header)) {
     return {
       ok: false,
       code: 'invalid_video_container',
-      message: 'This video format is not supported.',
+      message: 'Unsupported video format',
     }
   }
 
@@ -260,7 +290,7 @@ export async function gateSelectedFile(
     limits.maxVideoDurationSeconds > 0 &&
     durationSeconds > limits.maxVideoDurationSeconds
   ) {
-    return { ok: false, code: 'exceeds_duration_max', message: 'This video is too long.' }
+    return { ok: false, code: 'exceeds_duration_max', message: 'Video exceeds duration limit' }
   }
 
   const mimeType = resolveVideoMimeType(ext, browserMime)
@@ -270,6 +300,15 @@ export async function gateSelectedFile(
     mimeType,
     ext,
     durationSeconds,
-    headerBase64: bytesToBase64(header.slice(0, Math.min(header.byteLength, 64 * 1024))),
+    headerBase64: bytesToBase64(header.slice(0, Math.min(header.byteLength, VIDEO_HEADER_BYTES))),
   }
+}
+
+export function isIphoneSafari(): boolean {
+  if (typeof navigator === 'undefined') return false
+  const ua = navigator.userAgent
+  const iOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+  const webkit = /WebKit/.test(ua)
+  const notOther = !/CriOS|FxiOS|EdgiOS|OPiOS/.test(ua)
+  return iOS && webkit && notOther
 }

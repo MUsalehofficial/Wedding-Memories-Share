@@ -1,6 +1,9 @@
 /** MIME / extension / size validation before Drive session creation. */
 
 import { isIsoBmffContainer } from './iso_bmff.ts'
+import { MAX_VIDEO_BYTES, VIDEO_TOO_LARGE_MESSAGE } from './upload_limits.ts'
+
+export { MAX_VIDEO_BYTES, VIDEO_TOO_LARGE_MESSAGE } from './upload_limits.ts'
 
 const IMAGE_EXT: Record<string, string> = {
   jpg: 'image/jpeg',
@@ -103,11 +106,13 @@ export function validateUploadMeta(input: UploadMetaInput): ValidationOk | Valid
 
     const resolved = resolveVideoMimeType(ext, mime || (ext === 'mov' ? 'video/quicktime' : 'video/mp4'))
 
-    if (input.byteSize > input.maxVideoBytes) {
+    // Product ceiling is always MAX_VIDEO_BYTES; caller may pass a lower effective max.
+    const videoCap = Math.min(MAX_VIDEO_BYTES, input.maxVideoBytes)
+    if (input.byteSize > videoCap) {
       return {
         ok: false,
         code: 'exceeds_configured_max',
-        message: 'This video is too large.',
+        message: VIDEO_TOO_LARGE_MESSAGE,
       }
     }
 

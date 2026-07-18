@@ -1,5 +1,14 @@
 /** Capacity decisions from live Google Drive about.get — never invent total GB. */
 
+import {
+  DEFAULT_SAFETY_RESERVE_BYTES,
+  MAX_VIDEO_BYTES,
+  VIDEO_STORAGE_FULL_MESSAGE,
+  VIDEO_TOO_LARGE_MESSAGE,
+} from './upload_limits.ts'
+
+export { MAX_VIDEO_BYTES, DEFAULT_SAFETY_RESERVE_BYTES } from './upload_limits.ts'
+
 export type DriveQuota = {
   limit: number | null
   usage: number
@@ -68,6 +77,22 @@ export type UploadGate =
   | { ok: true }
   | { ok: false; code: string; message: string }
 
+/**
+ * Effective video ceiling for this moment:
+ * min(MAX_VIDEO_BYTES, Drive maxUploadSize, available − safetyReserve).
+ * Drive plan GB is never hardcoded — larger Google storage raises available automatically.
+ */
+export function effectiveMaxVideoBytes(
+  quota: DriveQuota,
+  safetyReserveBytes: number = DEFAULT_SAFETY_RESERVE_BYTES,
+): number | null {
+  const available = availableBytes(quota)
+  if (available == null) return null
+  const afterReserve = Math.max(0, available - safetyReserveBytes)
+  const driveCap = quota.maxUploadSize != null ? quota.maxUploadSize : Number.POSITIVE_INFINITY
+  return Math.min(MAX_VIDEO_BYTES, driveCap, afterReserve)
+}
+
 /** Recheck quota before each original upload session. */
 export function canCreateOriginalUpload(
   quota: DriveQuota,
@@ -92,29 +117,44 @@ export function canCreateOriginalUpload(
   if (!Number.isFinite(fileBytes) || fileBytes <= 0) {
     return { ok: false, code: 'invalid_size', message: 'Invalid file size.' }
   }
+
+  if (mediaKind === 'video' && fileBytes > MAX_VIDEO_BYTES) {
+    return {
+      ok: false,
+      code: 'exceeds_configured_max',
+      message: VIDEO_TOO_LARGE_MESSAGE,
+    }
+  }
+
   if (quota.maxUploadSize != null && fileBytes > quota.maxUploadSize) {
     return {
       ok: false,
       code: 'exceeds_max_upload_size',
-      message: 'This file exceeds Google Drive’s maximum upload size.',
+      message:
+        mediaKind === 'video'
+          ? VIDEO_TOO_LARGE_MESSAGE
+          : 'This file exceeds Google Drive’s maximum upload size.',
     }
   }
   const available = availableBytes(quota)
   if (available == null) {
-    // ponytail: unknown limit — still allow only if maxUploadSize permits; admin should monitor
-    // Safer for wedding: block when we cannot prove capacity
+    // ponytail: unknown limit — block when we cannot prove capacity
     return {
       ok: false,
       code: 'quota_unknown',
       message: 'Uploads temporarily unavailable — storage capacity could not be verified.',
     }
   }
-  const needed = fileBytes + settings.safetyReserveBytes
+  const reserve = settings.safetyReserveBytes ?? DEFAULT_SAFETY_RESERVE_BYTES
+  const needed = fileBytes + reserve
   if (needed > available) {
     return {
       ok: false,
       code: 'storage_full',
-      message: 'Uploads temporarily unavailable — not enough storage remaining.',
+      message:
+        mediaKind === 'video'
+          ? VIDEO_STORAGE_FULL_MESSAGE
+          : 'Uploads temporarily unavailable — not enough storage remaining.',
     }
   }
   return { ok: true }
